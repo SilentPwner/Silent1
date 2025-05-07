@@ -115,25 +115,33 @@ def generate_ml_signals(df):
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        # استخدام GridSearchCV للبحث عن أفضل المعلمات
-        param_grid = {
-            'n_estimators': [50, 100, 150],
-            'max_depth': [None, 10, 20],
-            'min_samples_split': [2, 5]
-        }
+        model_path = 'trading_model.pkl'
 
-        model = RandomForestClassifier(random_state=42)
-        grid_search = GridSearchCV(model, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
-        grid_search.fit(X_train, y_train)
+        # تحميل نموذج سابق إن وُجد
+        if os.path.exists(model_path):
+            model = joblib.load(model_path)
+            logging.info("🔄 تم تحميل نموذج ML سابق.")
+        else:
+            param_grid = {
+                'n_estimators': [50, 100, 150],
+                'max_depth': [None, 10, 20],
+                'min_samples_split': [2, 5]
+            }
+            model = RandomForestClassifier(random_state=42)
+            grid_search = GridSearchCV(model, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
+            grid_search.fit(X_train, y_train)
+            model = grid_search.best_estimator_
 
-        best_model = grid_search.best_estimator_
-        y_pred = best_model.predict(X_test)
+        y_pred = model.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
         logging.info(f"دقة النموذج: {accuracy:.2f}")
 
-        joblib.dump(best_model, 'trading_model.pkl')  # حفظ النموذج
+        # حفظ النموذج فقط إن كان أفضل من السابق
+        if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
+            joblib.dump(model, model_path)
+            logging.info("🆕 تم حفظ نموذج ML جديد.")
 
-        df['ml_signal'] = best_model.predict(X)
+        df['ml_signal'] = model.predict(X)
         logging.info("✅ تم توليد الإشارات الذكية باستخدام Random Forest.")
         return df
 
@@ -141,11 +149,28 @@ def generate_ml_signals(df):
         logging.error(f"❌ خطأ أثناء توليد الإشارات الذكية: {e}")
         raise
 
-# === حساب VaR ===
-def calculate_var(returns, confidence_level=0.95):
-    if len(returns) < 10:
-        return 0.02  # قيمة افتراضية
-    var = -np.percentile(returns, 100 * (1 - confidence_level))
+# === قراءة دقة النموذج السابق من ملف (إن وُجد) ===
+def get_previous_model_accuracy():
+    acc_file = 'model_accuracy.txt'
+    if os.path.exists(acc_file):
+        with open(acc_file, 'r') as f:
+            try:
+                return float(f.read().strip())
+            except:
+                return 0.0
+    return 0.0
+
+# === حفظ دقة النموذج الحالي في ملف ===
+def save_model_accuracy(accuracy):
+    with open('model_accuracy.txt', 'w') as f:
+        f.write(f"{accuracy:.4f}")
+
+# === حساب VaR باستخدام نافذة زمنية ===
+def calculate_var(returns, window=20, confidence_level=0.95):
+    if len(returns) < window:
+        return 0.02  # قيمة افتراضية إن كانت البيانات غير كافية
+    recent_returns = returns[-window:]  # استخدام آخر N عناصر فقط
+    var = -np.percentile(recent_returns, 100 * (1 - confidence_level))
     return var
 
 # === تنفيذ الصفقات الحقيقية عبر API ===
@@ -179,6 +204,11 @@ def execute_trades(df, symbol, balance):
             current_price = df['close'].iloc[i]
             atr = df['ATR'].iloc[i]
 
+            # التأكد من وجود الإشارة
+            if 'ml_signal' not in df.columns:
+                logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
+                continue
+
             # حساب Kelly
             returns = df['close'].pct_change().dropna()
             wins = returns[returns > 0]
@@ -189,8 +219,9 @@ def execute_trades(df, symbol, balance):
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
             kelly = max(0.01, min(kelly, 0.2))
 
-            # حساب VaR
-            risk_amount = calculate_var(returns)
+            # حساب VaR بناءً على آخر تغييرات السعر (نافذة زمنية)
+            recent_returns = df['close'].pct_change().dropna()
+            risk_amount = calculate_var(recent_returns, window=20)
 
             # تنفيذ الصفقات بناءً على الإشارة
             if df['ml_signal'].iloc[i-1] == 1 and position == 0:
@@ -249,15 +280,12 @@ def diversified_trading():
     results = {}
 
     dfs = {}
-    models_ready = {}
-
-    # جلب البيانات الأولية لكل عملة
     for symbol in symbols:
         df = fetch_live_data(symbol, '5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
-        models_ready[symbol] = True
+        logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
 
     while True:
         for symbol in symbols:
@@ -266,7 +294,7 @@ def diversified_trading():
                 df = calculate_indicators(df)
                 df = generate_ml_signals(df)
                 dfs[symbol] = df
-                logging.info(f"[{symbol}] تم تحديث البيانات وحساب المؤشرات والإشارات.")
+                logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
 
             final_balance = execute_trades(df, symbol, per_asset_balance)
             results[symbol] = final_balance
