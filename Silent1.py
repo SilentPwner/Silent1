@@ -37,10 +37,24 @@ try:
             'defaultType': 'spot',
         },
     })
-    logging.info("تم تسجيل الدخول بنجاح إلى CoinEx.")
+    logging.info("✅ تم تسجيل الدخول بنجاح إلى CoinEx.")
 except Exception as e:
-    logging.error(f"فشل تسجيل الدخول إلى CoinEx: {e}")
+    logging.error(f"❌ فشل تسجيل الدخول إلى CoinEx: {e}")
     raise
+
+# === جلب الرصيد الحقيقي من المنصة ===
+def get_real_balance():
+    try:
+        balance_info = exchange.fetch_balance()
+        usdt_balance = balance_info.get('USDT', {}).get('free', 0)
+        if usdt_balance <= 0:
+            logging.warning("⚠️ لا يوجد رصيد USDT حر. سيتم استخدام رصيد افتراضي قدره $100.")
+            return 100.0
+        logging.info(f"💰 الرصيد الحر في الحساب: {usdt_balance:.2f} USDT")
+        return float(usdt_balance)
+    except Exception as e:
+        logging.error(f"❌ خطأ أثناء جلب الرصيد من المنصة: {e}")
+        return 100.0  # قيمة افتراضية إن فشلت العملية
 
 # === جلب البيانات الحية عبر REST API ===
 def fetch_live_data(symbol, timeframe, limit=100):
@@ -134,11 +148,12 @@ def generate_ml_signals(df):
 
         y_pred = model.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
-        logging.info(f"دقة النموذج: {accuracy:.2f}")
+        logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
 
         # حفظ النموذج فقط إن كان أفضل من السابق
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
+            save_model_accuracy(accuracy)
             logging.info("🆕 تم حفظ نموذج ML جديد.")
 
         df['ml_signal'] = model.predict(X)
@@ -149,7 +164,7 @@ def generate_ml_signals(df):
         logging.error(f"❌ خطأ أثناء توليد الإشارات الذكية: {e}")
         raise
 
-# === قراءة دقة النموذج السابق من ملف (إن وُجد) ===
+# === قراءة دقة النموذج السابق من ملف ===
 def get_previous_model_accuracy():
     acc_file = 'model_accuracy.txt'
     if os.path.exists(acc_file):
@@ -171,24 +186,29 @@ def calculate_var(returns, window=20, confidence_level=0.95):
         return 0.02  # قيمة افتراضية إن كانت البيانات غير كافية
     recent_returns = returns[-window:]  # استخدام آخر N عناصر فقط
     var = -np.percentile(recent_returns, 100 * (1 - confidence_level))
-    return var
+    return abs(var)
 
 # === تنفيذ الصفقات الحقيقية عبر API ===
 def execute_real_trade(symbol, side, amount):
     try:
+        if amount < 0.0001:
+            logging.warning(f"⚠️ الكمية غير كافية للصفقة: {amount:.8f}")
+            return None
+
         if side == "buy":
             order = exchange.create_market_buy_order(symbol, amount)
             logging.info(f"✅ [BUY] أمر شراء تم تنفيذه: {order}")
         elif side == "sell":
             order = exchange.create_market_sell_order(symbol, amount)
             logging.info(f"✅ [SELL] أمر بيع تم تنفيذه: {order}")
+        return order
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
+        return None
 
 # === تنفيذ الصفقات ===
-def execute_trades(df, symbol, balance):
+def execute_trades(df, symbol, per_asset_balance):
     try:
-        initial_balance = balance
         position = 0
         trade_count = 0
         max_trades_per_day = 5
@@ -202,47 +222,46 @@ def execute_trades(df, symbol, balance):
                 continue
 
             current_price = df['close'].iloc[i]
-            atr = df['ATR'].iloc[i]
 
             # التأكد من وجود الإشارة
             if 'ml_signal' not in df.columns:
                 logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
                 continue
 
-            # حساب Kelly
+            # حساب العوائد التاريخية
             returns = df['close'].pct_change().dropna()
             wins = returns[returns > 0]
             losses = returns[returns < 0]
+
             win_prob = len(wins) / len(returns)
             avg_win = wins.mean() if not wins.empty else 0.005
             avg_loss = abs(losses.mean()) if not losses.empty else 0.005
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
-            kelly = max(0.01, min(kelly, 0.2))
+            kelly = max(0.01, min(kelly, 0.2))  # بين 1% و 20%
 
-            # حساب VaR بناءً على آخر تغييرات السعر (نافذة زمنية)
-            recent_returns = df['close'].pct_change().dropna()
-            risk_amount = calculate_var(recent_returns, window=20)
+            risk_amount = calculate_var(returns, window=20)
 
             # تنفيذ الصفقات بناءً على الإشارة
             if df['ml_signal'].iloc[i-1] == 1 and position == 0:
-                amount_to_invest = balance * kelly
+                amount_to_invest = per_asset_balance * kelly
                 amount = amount_to_invest / current_price
-                position = 1
                 buy_price = current_price
                 stop_loss = buy_price * (1 - risk_amount)
                 take_profit = buy_price * (1 + risk_amount * 2)
                 execute_real_trade(symbol, "buy", amount)
+                position = 1
                 last_trade_time = current_time
                 trade_count += 1
 
             elif df['ml_signal'].iloc[i-1] == 0 and position == 1:
                 execute_real_trade(symbol, "sell", amount)
                 sell_price = current_price
-                profit = (sell_price - buy_price) / buy_price * 100
-                balance += profit * amount * buy_price / 100
+                profit_percent = (sell_price - buy_price) / buy_price * 100
+                profit_value = amount * profit_percent / 100
+                per_asset_balance += profit_value
                 position = 0
                 trade_count += 1
-                if profit < 0:
+                if profit_percent < 0:
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
@@ -253,10 +272,11 @@ def execute_trades(df, symbol, balance):
                 if current_price <= stop_loss or current_price <= trailing_stop:
                     execute_real_trade(symbol, "sell", amount)
                     sell_price = current_price
-                    profit = (sell_price - buy_price) / buy_price * 100
-                    balance += profit * amount * buy_price / 100
+                    profit_percent = (sell_price - buy_price) / buy_price * 100
+                    profit_value = amount * profit_percent / 100
+                    per_asset_balance += profit_value
                     position = 0
-                    if profit < 0:
+                    if profit_percent < 0:
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
@@ -265,17 +285,17 @@ def execute_trades(df, symbol, balance):
                 logging.info("🛑 تم الوصول إلى الحد الأقصى للخسائر المتتالية.")
                 break
 
-        logging.info(f"💰 رصيدك النهائي: {balance:.2f} دولار")
-        return balance
+        logging.info(f"📊 [{symbol}] رصيد هذه العملة: {per_asset_balance:.2f} دولار")
+        return per_asset_balance
 
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
-        return balance
+        return per_asset_balance
 
 # === تنفيذ الصفقات على عدة عملات (Diversification) ===
 def diversified_trading():
     symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
-    total_balance = 100  # رأس المال الإجمالي
+    total_balance = get_real_balance()
     per_asset_balance = total_balance / len(symbols)
     results = {}
 
@@ -300,7 +320,7 @@ def diversified_trading():
             results[symbol] = final_balance
 
         overall_return = sum(results.values())
-        logging.info(f"📊 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
+        logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
         time.sleep(60)  # الانتظار دقيقة واحدة قبل المحاولة التالية
 
 # === الحلقة الرئيسية للبرنامج ===
