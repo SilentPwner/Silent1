@@ -10,13 +10,11 @@ import asyncio
 import websockets
 import json
 import pandas_ta as ta
-
 # 🔥 scikit-learn - للتعلم الآلي (Kelly Criterion)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score
 import joblib
-
 # === تحميل المتغيرات البيئية ===
 load_dotenv()
 API_KEY = os.getenv('COINEX_API_KEY')
@@ -41,8 +39,8 @@ try:
         },
         'urls': {
             'api': {
-                'public': 'https://api.coinex.com/v2/spot', 
-                'private': 'https://api.coinex.com/v2/spot', 
+                'public': 'https://api.coinex.com/v2/spot',  
+                'private': 'https://api.coinex.com/v2/spot',  
             },
             'websocket': 'wss://socket.coinex.com/v2/spot'
         }
@@ -93,15 +91,11 @@ def generate_ml_signals(df):
     try:
         features = ['SMA', 'RSI', 'MACD', 'stoch_k', 'ATR', 'upper_band', 'lower_band']
         df = df.dropna(subset=features)
-
         df['future_close'] = df['close'].shift(-1)
         df['ml_signal'] = np.where(df['future_close'] > df['close'], 1, 0)
-
         X = df[features]
         y = df['ml_signal']
-
         model_path = 'trading_model.pkl'
-
         if os.path.exists(model_path):
             model = joblib.load(model_path)
             logging.info("🔄 تم تحميل نموذج ML سابق.")
@@ -119,12 +113,10 @@ def generate_ml_signals(df):
             y_pred = model.predict(X_test)
             accuracy = accuracy_score(y_test, y_pred)
             logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
-
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
             logging.info("🆕 تم حفظ نموذج ML جديد.")
-
         df['ml_signal'] = model.predict(X)
         logging.info("✅ تم توليد الإشارات الذكية باستخدام Random Forest.")
         return df
@@ -162,14 +154,12 @@ def execute_real_trade(symbol, side, amount):
         if amount < 0.0001:
             logging.warning(f"⚠️ الكمية غير كافية للصفقة: {amount:.8f}")
             return None
-
         if side == "buy":
             order = exchange.create_market_buy_order(symbol, amount)
             logging.info(f"✅ [BUY] أمر شراء تم تنفيذه: {order}")
         elif side == "sell":
             order = exchange.create_market_sell_order(symbol, amount)
             logging.info(f"✅ [SELL] أمر بيع تم تنفيذه: {order}")
-
         return order
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
@@ -183,35 +173,27 @@ def execute_trades(df, symbol, per_asset_balance):
         max_trades_per_day = 5
         last_trade_time = 0
         consecutive_losses = 0
-
         for i in range(1, len(df)):
             current_time = time.time()
             if current_time - last_trade_time < 1800 or trade_count >= max_trades_per_day:
                 continue
-
             current_price = df['close'].iloc[i]
-
             # التأكد من وجود الإشارة
             if 'ml_signal' not in df.columns:
                 logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
                 continue
-
             # حساب العوائد التاريخية
             returns = df['close'].pct_change().dropna()
             wins = returns[returns > 0]
             losses = returns[returns < 0]
-
             win_prob = len(wins) / len(returns)
             avg_win = wins.mean() if not wins.empty else 0.005
             avg_loss = abs(losses.mean()) if not losses.empty else 0.005
-
             # حساب Kelly
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
             kelly = max(0.01, min(kelly, 0.2))  # بين 1% و 20%
-
             # حساب VaR
             risk_amount = calculate_var(returns, window=20)
-
             # تنفيذ صفقة شراء
             if df['ml_signal'].iloc[i-1] == 1 and position == 0:
                 amount_to_invest = per_asset_balance * kelly
@@ -223,7 +205,6 @@ def execute_trades(df, symbol, per_asset_balance):
                 position = 1
                 last_trade_time = current_time
                 trade_count += 1
-
             # تنفيذ صفقة بيع
             elif df['ml_signal'].iloc[i-1] == 0 and position == 1:
                 execute_real_trade(symbol, "sell", amount)
@@ -237,7 +218,6 @@ def execute_trades(df, symbol, per_asset_balance):
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
-
             # Trailing Stop
             if position == 1:
                 trailing_stop = current_price * 0.98
@@ -252,14 +232,11 @@ def execute_trades(df, symbol, per_asset_balance):
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
-
             if consecutive_losses >= 3:
                 logging.info("🛑 تم الوصول إلى الحد الأقصى للخسائر المتتالية.")
                 break
-
         logging.info(f"📊 [{symbol}] رصيد هذه العملة: {per_asset_balance:.2f} دولار")
         return per_asset_balance
-
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
         return per_asset_balance
@@ -275,12 +252,10 @@ async def ws_update_data(symbol):
         }
         await websocket.send(json.dumps(subscribe_msg))
         logging.info(f"[{symbol}] اشتراك في WebSocket")
-
         while True:
             try:
                 message = await websocket.recv()
                 data = json.loads(message)
-
                 if 'data' in data:
                     ohlcv = data['data']
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -288,7 +263,6 @@ async def ws_update_data(symbol):
                     df = calculate_indicators(df)
                     df = generate_ml_signals(df)
                     yield df
-
                 await asyncio.sleep(1)
             except websockets.ConnectionClosed:
                 logging.error(f"[{symbol}] ❌ انقطع الاتصال بـ WebSocket. إعادة الاتصال...")
@@ -303,7 +277,6 @@ async def run_trading_engine():
     investment_capital = total_balance * 0.2  # استثمار 20% من الرصيد
     per_asset_balance = investment_capital / len(symbols)
     dfs = {}
-
     # تجهيز البيانات الأولية لكل عملة
     for symbol in symbols:
         df = fetch_live_data(symbol, '5m', limit=100)
@@ -311,7 +284,6 @@ async def run_trading_engine():
         df = generate_ml_signals(df)
         dfs[symbol] = df
         logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
-
     # بدء التداول الزمني
     while True:
         for symbol in symbols:
@@ -324,7 +296,6 @@ async def run_trading_engine():
                 logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
             final_balance = execute_trades(df, symbol, per_asset_balance)
             logging.info(f"[{symbol}] العائد: {final_balance:.2f} دولار")
-
         overall_return = sum([final_balance for _, final_balance in dfs.items()])
         logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
         await asyncio.sleep(60)
@@ -347,7 +318,6 @@ def fetch_new_data_only(df_old, symbol, timeframe):
         latest_timestamp = df_old['timestamp'].iloc[-1]
         new_df = fetch_live_data(symbol, timeframe, limit=10)  # جلب آخر 10 شموع فقط
         new_data = new_df[new_df['timestamp'] > latest_timestamp]  # اختيار الشموع الجديدة فقط
-
         if not new_data.empty:
             updated_df = pd.concat([df_old, new_data], ignore_index=True)
             logging.info(f"[{symbol}] تم تحديث البيانات. عدد الشموع الجديدة: {len(new_data)}")
@@ -365,3 +335,27 @@ async def main_loop():
         await run_trading_engine()
     except KeyboardInterrupt:
         logging.info("🛑 البوت توقف يدويًا.")
+
+# =====================================================================================
+# ✅ START WEB SERVER HERE (Using Flask)
+# =====================================================================================
+
+import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Trading Bot is Running 🚀"
+
+def run_server():
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    server_thread = threading.Thread(target=run_server)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    asyncio.run(main_loop())
