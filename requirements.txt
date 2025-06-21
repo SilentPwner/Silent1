@@ -5,7 +5,7 @@ scipy==1.10.1        # العمليات العلمية والرياضية
 # المكتبات المالية والتجارة الآلية
 ccxt==2.1.78         # الاتصال بالمنصات مثل CoinEx
 pandas       # معالجة البيانات OHLCV
-pandas_ta==0.4.2    # المؤشرات الفنية (RSI, MACD, Bollinger...)
+pandas_ta    # المؤشرات الفنية (RSI, MACD, Bollinger...)
 
 # إدارة المتغيرات البيئية
 python-dotenv==1.0.0  # قراءة API Keys من ملف .env
