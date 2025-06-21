@@ -6,6 +6,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 import os
+import asyncio
+import websockets
+import json
 import pandas_ta as ta
 
 # 🔥 scikit-learn - للتعلم الآلي (Kelly Criterion)
@@ -27,7 +30,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# === الاتصال بمنصة CoinEx ===
+# === الاتصال بمنصة CoinEx باستخدام WebSockets ===
 try:
     exchange = ccxt.coinex({
         'apiKey': API_KEY,
@@ -36,6 +39,13 @@ try:
         'options': {
             'defaultType': 'spot',
         },
+        'urls': {
+            'api': {
+                'public': 'https://api.coinex.com/v2/spot', 
+                'private': 'https://api.coinex.com/v2/spot', 
+            },
+            'websocket': 'wss://socket.coinex.com/v2/spot'
+        }
     })
     logging.info("✅ تم تسجيل الدخول بنجاح إلى CoinEx.")
 except Exception as e:
@@ -56,55 +66,19 @@ def get_real_balance():
         logging.error(f"❌ خطأ أثناء جلب الرصيد من المنصة: {e}")
         return 100.0  # قيمة افتراضية إن فشلت العملية
 
-# === جلب البيانات الحية عبر REST API ===
-def fetch_live_data(symbol, timeframe, limit=100):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        logging.info(f"[{symbol}] تم جلب البيانات بنجاح.")
-        return df
-    except Exception as e:
-        logging.error(f"[{symbol}] خطأ أثناء جلب البيانات: {e}")
-        raise
-
-# === تحديث البيانات بشكل ذكي (جلب الجديد فقط) ===
-def fetch_new_data_only(df_old, symbol, timeframe):
-    try:
-        latest_timestamp = df_old['timestamp'].iloc[-1]
-        new_df = fetch_live_data(symbol, timeframe, limit=10)  # جلب آخر 10 شموع فقط
-        new_data = new_df[new_df['timestamp'] > latest_timestamp]  # اختيار الشموع الجديدة فقط
-
-        if not new_data.empty:
-            updated_df = pd.concat([df_old, new_data], ignore_index=True)
-            logging.info(f"[{symbol}] تم تحديث البيانات. عدد الشموع الجديدة: {len(new_data)}")
-            return updated_df
-        else:
-            logging.info(f"[{symbol}] لا توجد بيانات جديدة بعد آخر تحقق.")
-            return df_old
-    except Exception as e:
-        logging.error(f"[{symbol}] خطأ أثناء تحديث البيانات: {e}")
-        return df_old
-
 # === حساب المؤشرات الفنية باستخدام Pandas TA ===
 def calculate_indicators(df):
     try:
-        # SMA
         df['SMA'] = ta.sma(df['close'], length=20)
-        # RSI
         df['RSI'] = ta.rsi(df['close'], length=14)
-        # MACD
         macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
         df['MACD'] = macd[f'MACD_{12}_{26}_{9}']
         df['MACD_signal'] = macd[f'MACDs_{12}_{26}_{9}']
-        # Bollinger Bands
         bollinger = ta.bbands(df['close'], length=20, std=2)
         df['upper_band'] = bollinger['BBU_20_2.0']
         df['middle_band'] = bollinger['BBM_20_2.0']
         df['lower_band'] = bollinger['BBL_20_2.0']
-        # ATR
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        # Stochastic Oscillator
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
         df['stoch_k'] = stoch['STOCHk_14_3_3']
         df['stoch_d'] = stoch['STOCHd_14_3_3']
@@ -120,7 +94,6 @@ def generate_ml_signals(df):
         features = ['SMA', 'RSI', 'MACD', 'stoch_k', 'ATR', 'upper_band', 'lower_band']
         df = df.dropna(subset=features)
 
-        # تحديد الإشارة: إذا كان السعر بعد خطوة أعلى، فهي إشارة شراء (1)، وإلا بيع (0)
         df['future_close'] = df['close'].shift(-1)
         df['ml_signal'] = np.where(df['future_close'] > df['close'], 1, 0)
 
@@ -131,7 +104,6 @@ def generate_ml_signals(df):
 
         model_path = 'trading_model.pkl'
 
-        # تحميل نموذج سابق إن وُجد
         if os.path.exists(model_path):
             model = joblib.load(model_path)
             logging.info("🔄 تم تحميل نموذج ML سابق.")
@@ -150,7 +122,6 @@ def generate_ml_signals(df):
         accuracy = accuracy_score(y_test, y_pred)
         logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
 
-        # حفظ النموذج فقط إن كان أفضل من السابق
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
@@ -183,8 +154,8 @@ def save_model_accuracy(accuracy):
 # === حساب VaR باستخدام نافذة زمنية ===
 def calculate_var(returns, window=20, confidence_level=0.95):
     if len(returns) < window:
-        return 0.02  # قيمة افتراضية إن كانت البيانات غير كافية
-    recent_returns = returns[-window:]  # استخدام آخر N عناصر فقط
+        return 0.02
+    recent_returns = returns[-window:]
     var = -np.percentile(recent_returns, 100 * (1 - confidence_level))
     return abs(var)
 
@@ -201,6 +172,7 @@ def execute_real_trade(symbol, side, amount):
         elif side == "sell":
             order = exchange.create_market_sell_order(symbol, amount)
             logging.info(f"✅ [SELL] أمر بيع تم تنفيذه: {order}")
+
         return order
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
@@ -236,6 +208,7 @@ def execute_trades(df, symbol, per_asset_balance):
             win_prob = len(wins) / len(returns)
             avg_win = wins.mean() if not wins.empty else 0.005
             avg_loss = abs(losses.mean()) if not losses.empty else 0.005
+
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
             kelly = max(0.01, min(kelly, 0.2))  # بين 1% و 20%
 
@@ -292,43 +265,71 @@ def execute_trades(df, symbol, per_asset_balance):
         logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
         return per_asset_balance
 
+# === تحديث البيانات عبر WebSocket ===
+async def ws_update_data(symbol, timeframe='5m', limit=100):
+    uri = 'wss://socket.coinex.com/v2/spot'
+    async with websockets.connect(uri) as websocket:
+        # إرسال رسالة الاشتراك
+        subscribe_msg = {
+            "method": "state",
+            "params": [symbol, timeframe, limit],
+            "id": 123
+        }
+        await websocket.send(json.dumps(subscribe_msg))
+
+        while True:
+            message = await websocket.recv()
+            data = json.loads(message)
+            
+            # التحقق من وجود بيانات جديدة
+            if 'data' in data:
+                ohlcv = data['data']
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df = calculate_indicators(df)
+                df = generate_ml_signals(df)
+                yield df
+            await asyncio.sleep(1)
+
 # === تنفيذ الصفقات على عدة عملات (Diversification) ===
-def diversified_trading():
+async def diversified_trading():
     symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
     total_balance = get_real_balance()
-    per_asset_balance = total_balance / len(symbols)
+    investment_capital = total_balance * 0.2  # استثمار 20% من الرصيد فقط
+    per_asset_balance = investment_capital / len(symbols)
     results = {}
 
     dfs = {}
     for symbol in symbols:
-        df = fetch_live_data(symbol, '5m', limit=100)
+        df = fetch_live_data(symbol, timeframe='5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
         logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
 
-    while True:
+    # بدء WebSocket لكل زوج
+    async for df in ws_update_data('BTC/USDT'):
         for symbol in symbols:
-            df = fetch_new_data_only(dfs[symbol], symbol, '5m')
-            if len(df) > len(dfs[symbol]):
-                df = calculate_indicators(df)
-                df = generate_ml_signals(df)
-                dfs[symbol] = df
-                logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
+            if symbol in df.columns:
+                updated_df = fetch_new_data_only(dfs[symbol], symbol, '5m')
+                if len(updated_df) > len(dfs[symbol]):
+                    updated_df = calculate_indicators(updated_df)
+                    updated_df = generate_ml_signals(updated_df)
+                    dfs[symbol] = updated_df
+                    logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
 
-            final_balance = execute_trades(df, symbol, per_asset_balance)
-            results[symbol] = final_balance
+                final_balance = execute_trades(updated_df, symbol, per_asset_balance)
+                results[symbol] = final_balance
 
         overall_return = sum(results.values())
         logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
-        time.sleep(60)  # الانتظار دقيقة واحدة قبل المحاولة التالية
 
 # === الحلقة الرئيسية للبرنامج ===
-def main_loop():
+async def main_loop():
     while True:
-        diversified_trading()
+        await diversified_trading()
 
 # === تشغيل البرنامج ===
 if __name__ == "__main__":
     logging.info("🚀 البوت قيد التشغيل...")
-    main_loop()
+    asyncio.run(main_loop())
