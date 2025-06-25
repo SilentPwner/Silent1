@@ -10,11 +10,11 @@ import asyncio
 import websockets
 import json
 import pandas_ta as ta
-# 🔥 scikit-learn - للتعلم الآلي (Kelly Criterion)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score
 import joblib
+
 # === تحميل المتغيرات البيئية ===
 load_dotenv()
 API_KEY = os.getenv('COINEX_API_KEY')
@@ -28,7 +28,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# === الاتصال بمنصة CoinEx باستخدام WebSockets ===
+# === تعريف الاتصال الصحيح بمنصة CoinEx ===
 try:
     exchange = ccxt.coinex({
         'apiKey': API_KEY,
@@ -36,13 +36,35 @@ try:
         'enableRateLimit': True,
         'options': {
             'defaultType': 'spot',
+            'adjustForTimeDifference': True,
         },
         'urls': {
-            'api': {
-                'public': 'https://api.coinex.com/v2/spot',  
-                'private': 'https://api.coinex.com/v2/spot',  
+            'api': 'https://api.coinex.com/v2',   # Base URL فقط
+            'websocket': 'wss://socket.coinex.com/v2/spot',
+        },
+        'api': {
+            'public': {
+                'get': [
+                    'spot/market/info',
+                    'spot/market/ticker/all',
+                    'spot/order-book/{symbol}',
+                    'spot/trades/{symbol}',
+                    'spot/kline-data',
+                ],
+                'post': []
             },
-            'websocket': 'wss://socket.coinex.com/v2/spot'
+            'private': {
+                'get': [
+                    'spot/balance',
+                    'spot/order',
+                    'spot/order/history',
+                    'spot/order/deals',
+                ],
+                'post': [
+                    'spot/order/place',
+                    'spot/order/cancel',
+                ]
+            }
         }
     })
     logging.info("✅ تم تسجيل الدخول بنجاح إلى CoinEx.")
@@ -247,7 +269,7 @@ async def ws_update_data(symbol):
     async with websockets.connect(uri) as websocket:
         subscribe_msg = {
             "method": "state",
-            "params": [symbol, '5m', 100],
+            "params": [f"{symbol.replace('/', '')}", '5m', 100],  # BTCUSDT وليس BTC/USDT
             "id": int(time.time())
         }
         await websocket.send(json.dumps(subscribe_msg))
@@ -339,7 +361,6 @@ async def main_loop():
 # =====================================================================================
 # ✅ START WEB SERVER HERE (Using Flask)
 # =====================================================================================
-
 import threading
 from flask import Flask
 
@@ -357,5 +378,4 @@ if __name__ == "__main__":
     server_thread = threading.Thread(target=run_server)
     server_thread.daemon = True
     server_thread.start()
-    
     asyncio.run(main_loop())
