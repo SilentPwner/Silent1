@@ -54,21 +54,68 @@ def private_api_call(endpoint, method="GET", params=None):
         params = {}
     params['timestamp'] = timestamp
     params['sign'] = sign_request(params, API_SECRET)
-
     if method == "GET":
         response = requests.get(url, params=params, headers=headers)
     elif method == "POST":
         response = requests.post(url, data=json.dumps(params), headers=headers)
     else:
         raise ValueError("Unsupported HTTP method")
-
     try:
         response.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        logging.error(f"❌ خطأ في الاتصال بالسيرفر: {e}")
+        logging.error(f"❌ خطأ في الاتصال بالخادم: {e}")
         raise
-
     return response.json()
+
+# === جلب معلومات السوق ===
+def get_market_info(markets=None):
+    """
+    جلب معلومات السوق من CoinEx API.
+    
+    :param markets: قائمة بأسماء الأسواق (مثال: ['BTCUSDT', 'ETHUSDT']) أو None للجميع
+    :return: بيانات السوق
+    """
+    url = f"{REST_URL}/spot/market"
+    params = {}
+
+    if markets:
+        if len(markets) > 10:
+            raise ValueError("يُسمح بحد أقصى 10 أسواق فقط.")
+        params["market"] = ",".join(markets)
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("code") == 0:
+            market_data = {}
+            for item in data.get("data", []):
+                market_name = item["market"]
+                market_data[market_name] = {
+                    "taker_fee_rate": float(item["taker_fee_rate"]),
+                    "maker_fee_rate": float(item["maker_fee_rate"]),
+                    "min_amount": float(item["min_amount"]),
+                    "base_ccy": item["base_ccy"],
+                    "quote_ccy": item["quote_ccy"],
+                    "base_precision": item["base_ccy_precision"],
+                    "quote_precision": item["quote_ccy_precision"],
+                    "status": item.get("status", "active"),
+                    "is_amm_available": item["is_amm_available"],
+                    "is_margin_available": item["is_margin_available"],
+                    "is_pre_trading_available": item["is_pre_trading_available"],
+                    "is_api_trading_available": item["is_api_trading_available"],
+                }
+            logging.info(f"✅ تم استرجاع معلومات السوق بنجاح: {list(market_data.keys())}")
+            return market_data
+        else:
+            error_msg = data.get("message", "Unknown error")
+            logging.error(f"❌ فشل في جلب معلومات السوق: {error_msg}")
+            return None
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ خطأ أثناء الاتصال بواجهة CoinEx API: {e}")
+        return None
 
 # === جلب الرصيد ===
 def fetch_balance():
@@ -142,8 +189,6 @@ async def ws_update_data(symbol):
             except websockets.ConnectionClosed:
                 logging.error(f"[{symbol}] ❌ انقطع الاتصال بـ WebSocket. إعادة الاتصال...")
                 await asyncio.sleep(10)
-                await websocket.close()
-                await websocket.connect()
 
 # === جلب الرصيد الحقيقي من المنصة ===
 def get_real_balance():
@@ -191,7 +236,6 @@ def generate_ml_signals(df):
         X = df[features]
         y = df['ml_signal']
         model_path = 'trading_model.pkl'
-
         if os.path.exists(model_path):
             model = joblib.load(model_path)
             logging.info("🔄 تم تحميل نموذج ML سابق.")
@@ -209,12 +253,10 @@ def generate_ml_signals(df):
             y_pred = model.predict(X_test)
             accuracy = accuracy_score(y_test, y_pred)
             logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
-
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
             logging.info("🆕 تم حفظ نموذج ML جديد.")
-
         df['ml_signal'] = model.predict(X)
         logging.info("✅ تم توليد الإشارات الذكية باستخدام Random Forest.")
         return df
@@ -356,12 +398,25 @@ async def run_trading_engine():
     investment_capital = total_balance * 0.2
     per_asset_balance = investment_capital / len(symbols)
     dfs = {}
+    
+    # --- التحقق من صلاحية التداول لكل سوق ---
+    markets_list = [s.replace("/", "") for s in symbols]
+    market_info = get_market_info(markets_list)
+    if not market_info:
+        logging.error("❌ لم يتم العثور على معلومات السوق. سيتم إنهاء التشغيل.")
+        return
+
     for symbol in symbols:
+        market_key = symbol.replace("/", "")
+        if not market_info[market_key].get("is_api_trading_available", False):
+            logging.error(f"❌ التداول عبر API غير مفعل لسوق {market_key}.")
+            continue
         df = fetch_ohlcv(symbol, '5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
         logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
+
     while True:
         for symbol in symbols:
             df = dfs[symbol]
