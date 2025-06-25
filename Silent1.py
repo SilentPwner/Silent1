@@ -14,6 +14,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import accuracy_score
 import joblib
+from flask import Flask
+import threading
 
 # === تحميل المتغيرات البيئية ===
 load_dotenv()
@@ -39,32 +41,35 @@ try:
             'adjustForTimeDifference': True,
         },
         'urls': {
-            'api': 'https://api.coinex.com/v2',   # Base URL فقط
-            'websocket': 'wss://socket.coinex.com/v2/spot',
+            'api': {
+                'public': 'https://api.coinex.com/v2/spot', 
+                'private': 'https://api.coinex.com/v2/spot', 
+            },
+            'websocket': 'wss://socket.coinex.com/v2/spot'
         },
         'api': {
             'public': {
                 'get': [
-                    'spot/market/info',
-                    'spot/market/ticker/all',
-                    'spot/order-book/{symbol}',
-                    'spot/trades/{symbol}',
-                    'spot/kline-data',
+                    'common/asset/config',
+                    'market/ticker/all',
+                    'market/order-book',
+                    'trades',
+                    'kline-data',
                 ],
-                'post': []
+                'post': [],
             },
             'private': {
                 'get': [
-                    'spot/balance',
-                    'spot/order',
-                    'spot/order/history',
-                    'spot/order/deals',
+                    'balance',
+                    'order',
+                    'order/history',
+                    'order/deals',
                 ],
                 'post': [
-                    'spot/order/place',
-                    'spot/order/cancel',
-                ]
-            }
+                    'order/place',
+                    'order/cancel',
+                ],
+            },
         }
     })
     logging.info("✅ تم تسجيل الدخول بنجاح إلى CoinEx.")
@@ -187,89 +192,14 @@ def execute_real_trade(symbol, side, amount):
         logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
         return None
 
-# === تنفيذ الصفقات لكل عملة ===
-def execute_trades(df, symbol, per_asset_balance):
-    try:
-        position = 0
-        trade_count = 0
-        max_trades_per_day = 5
-        last_trade_time = 0
-        consecutive_losses = 0
-        for i in range(1, len(df)):
-            current_time = time.time()
-            if current_time - last_trade_time < 1800 or trade_count >= max_trades_per_day:
-                continue
-            current_price = df['close'].iloc[i]
-            # التأكد من وجود الإشارة
-            if 'ml_signal' not in df.columns:
-                logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
-                continue
-            # حساب العوائد التاريخية
-            returns = df['close'].pct_change().dropna()
-            wins = returns[returns > 0]
-            losses = returns[returns < 0]
-            win_prob = len(wins) / len(returns)
-            avg_win = wins.mean() if not wins.empty else 0.005
-            avg_loss = abs(losses.mean()) if not losses.empty else 0.005
-            # حساب Kelly
-            kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
-            kelly = max(0.01, min(kelly, 0.2))  # بين 1% و 20%
-            # حساب VaR
-            risk_amount = calculate_var(returns, window=20)
-            # تنفيذ صفقة شراء
-            if df['ml_signal'].iloc[i-1] == 1 and position == 0:
-                amount_to_invest = per_asset_balance * kelly
-                amount = amount_to_invest / current_price
-                buy_price = current_price
-                stop_loss = buy_price * (1 - risk_amount)
-                take_profit = buy_price * (1 + risk_amount * 2)
-                execute_real_trade(symbol, "buy", amount)
-                position = 1
-                last_trade_time = current_time
-                trade_count += 1
-            # تنفيذ صفقة بيع
-            elif df['ml_signal'].iloc[i-1] == 0 and position == 1:
-                execute_real_trade(symbol, "sell", amount)
-                sell_price = current_price
-                profit_percent = (sell_price - buy_price) / buy_price * 100
-                profit_value = amount * profit_percent / 100
-                per_asset_balance += profit_value
-                position = 0
-                trade_count += 1
-                if profit_percent < 0:
-                    consecutive_losses += 1
-                else:
-                    consecutive_losses = 0
-            # Trailing Stop
-            if position == 1:
-                trailing_stop = current_price * 0.98
-                if current_price <= stop_loss or current_price <= trailing_stop:
-                    execute_real_trade(symbol, "sell", amount)
-                    sell_price = current_price
-                    profit_percent = (sell_price - buy_price) / buy_price * 100
-                    profit_value = amount * profit_percent / 100
-                    per_asset_balance += profit_value
-                    position = 0
-                    if profit_percent < 0:
-                        consecutive_losses += 1
-                    else:
-                        consecutive_losses = 0
-            if consecutive_losses >= 3:
-                logging.info("🛑 تم الوصول إلى الحد الأقصى للخسائر المتتالية.")
-                break
-        logging.info(f"📊 [{symbol}] رصيد هذه العملة: {per_asset_balance:.2f} دولار")
-        return per_asset_balance
-    except Exception as e:
-        logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
-        return per_asset_balance
-
 # === تحديث البيانات عبر WebSocket ===
 async def ws_update_data(symbol):
     uri = 'wss://socket.coinex.com/v2/spot'
+    symbol_clean = symbol.replace('/', '')
     async with websockets.connect(uri) as websocket:
         subscribe_msg = {
             "method": "state",
-            "params": [f"{symbol.replace('/', '')}", '5m', 100],  # BTCUSDT وليس BTC/USDT
+            "params": [symbol_clean, '5m', 100],
             "id": int(time.time())
         }
         await websocket.send(json.dumps(subscribe_msg))
@@ -292,36 +222,6 @@ async def ws_update_data(symbol):
                 await websocket.close()
                 await websocket.connect()
 
-# === تنفيذ الصفقات على عدة عملات (Diversification) ===
-async def run_trading_engine():
-    symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
-    total_balance = get_real_balance()
-    investment_capital = total_balance * 0.2  # استثمار 20% من الرصيد
-    per_asset_balance = investment_capital / len(symbols)
-    dfs = {}
-    # تجهيز البيانات الأولية لكل عملة
-    for symbol in symbols:
-        df = fetch_live_data(symbol, '5m', limit=100)
-        df = calculate_indicators(df)
-        df = generate_ml_signals(df)
-        dfs[symbol] = df
-        logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
-    # بدء التداول الزمني
-    while True:
-        for symbol in symbols:
-            df = dfs[symbol]
-            df = fetch_new_data_only(df, symbol, '5m')
-            if len(df) > len(dfs[symbol]):
-                df = calculate_indicators(df)
-                df = generate_ml_signals(df)
-                dfs[symbol] = df
-                logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
-            final_balance = execute_trades(df, symbol, per_asset_balance)
-            logging.info(f"[{symbol}] العائد: {final_balance:.2f} دولار")
-        overall_return = sum([final_balance for _, final_balance in dfs.items()])
-        logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
-        await asyncio.sleep(60)
-
 # === جلب البيانات الحية عبر REST API ===
 def fetch_live_data(symbol, timeframe, limit=100):
     try:
@@ -338,8 +238,8 @@ def fetch_live_data(symbol, timeframe, limit=100):
 def fetch_new_data_only(df_old, symbol, timeframe):
     try:
         latest_timestamp = df_old['timestamp'].iloc[-1]
-        new_df = fetch_live_data(symbol, timeframe, limit=10)  # جلب آخر 10 شموع فقط
-        new_data = new_df[new_df['timestamp'] > latest_timestamp]  # اختيار الشموع الجديدة فقط
+        new_df = fetch_live_data(symbol, timeframe, limit=10)
+        new_data = new_df[new_df['timestamp'] > latest_timestamp]
         if not new_data.empty:
             updated_df = pd.concat([df_old, new_data], ignore_index=True)
             logging.info(f"[{symbol}] تم تحديث البيانات. عدد الشموع الجديدة: {len(new_data)}")
@@ -351,6 +251,103 @@ def fetch_new_data_only(df_old, symbol, timeframe):
         logging.error(f"[{symbol}] خطأ أثناء تحديث البيانات: {e}")
         return df_old
 
+# === تنفيذ الصفقات لكل عملة ===
+def execute_trades(df, symbol, per_asset_balance):
+    try:
+        position = 0
+        trade_count = 0
+        max_trades_per_day = 5
+        last_trade_time = 0
+        consecutive_losses = 0
+        for i in range(1, len(df)):
+            current_time = time.time()
+            if current_time - last_trade_time < 1800 or trade_count >= max_trades_per_day:
+                continue
+            current_price = df['close'].iloc[i]
+            if 'ml_signal' not in df.columns:
+                logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
+                continue
+            returns = df['close'].pct_change().dropna()
+            wins = returns[returns > 0]
+            losses = returns[returns < 0]
+            win_prob = len(wins) / len(returns)
+            avg_win = wins.mean() if not wins.empty else 0.005
+            avg_loss = abs(losses.mean()) if not losses.empty else 0.005
+            kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
+            kelly = max(0.01, min(kelly, 0.2))
+            risk_amount = calculate_var(returns, window=20)
+            if df['ml_signal'].iloc[i-1] == 1 and position == 0:
+                amount_to_invest = per_asset_balance * kelly
+                amount = amount_to_invest / current_price
+                buy_price = current_price
+                stop_loss = buy_price * (1 - risk_amount)
+                take_profit = buy_price * (1 + risk_amount * 2)
+                execute_real_trade(symbol, "buy", amount)
+                position = 1
+                last_trade_time = current_time
+                trade_count += 1
+            elif df['ml_signal'].iloc[i-1] == 0 and position == 1:
+                execute_real_trade(symbol, "sell", amount)
+                sell_price = current_price
+                profit_percent = (sell_price - buy_price) / buy_price * 100
+                profit_value = amount * profit_percent / 100
+                per_asset_balance += profit_value
+                position = 0
+                trade_count += 1
+                if profit_percent < 0:
+                    consecutive_losses += 1
+                else:
+                    consecutive_losses = 0
+            if position == 1:
+                trailing_stop = current_price * 0.98
+                if current_price <= stop_loss or current_price <= trailing_stop:
+                    execute_real_trade(symbol, "sell", amount)
+                    sell_price = current_price
+                    profit_percent = (sell_price - buy_price) / buy_price * 100
+                    profit_value = amount * profit_percent / 100
+                    per_asset_balance += profit_value
+                    position = 0
+                    if profit_percent < 0:
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
+            if consecutive_losses >= 3:
+                logging.info("🛑 تم الوصول إلى الحد الأقصى للخسائر المتتالية.")
+                break
+        logging.info(f"📊 [{symbol}] رصيد هذه العملة: {per_asset_balance:.2f} دولار")
+        return per_asset_balance
+    except Exception as e:
+        logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
+        return per_asset_balance
+
+# === تنفيذ الصفقات على عدة عملات (Diversification) ===
+async def run_trading_engine():
+    symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+    total_balance = get_real_balance()
+    investment_capital = total_balance * 0.2
+    per_asset_balance = investment_capital / len(symbols)
+    dfs = {}
+    for symbol in symbols:
+        df = fetch_live_data(symbol, '5m', limit=100)
+        df = calculate_indicators(df)
+        df = generate_ml_signals(df)
+        dfs[symbol] = df
+        logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
+    while True:
+        for symbol in symbols:
+            df = dfs[symbol]
+            df = fetch_new_data_only(df, symbol, '5m')
+            if len(df) > len(dfs[symbol]):
+                df = calculate_indicators(df)
+                df = generate_ml_signals(df)
+                dfs[symbol] = df
+                logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
+            final_balance = execute_trades(df, symbol, per_asset_balance)
+            logging.info(f"[{symbol}] العائد: {final_balance:.2f} دولار")
+        overall_return = sum([final_balance for _, final_balance in dfs.items()])
+        logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
+        await asyncio.sleep(60)
+
 # === الحلقة الرئيسية للبرنامج ===
 async def main_loop():
     try:
@@ -361,11 +358,7 @@ async def main_loop():
 # =====================================================================================
 # ✅ START WEB SERVER HERE (Using Flask)
 # =====================================================================================
-import threading
-from flask import Flask
-
 app = Flask(__name__)
-
 @app.route('/')
 def home():
     return "Trading Bot is Running 🚀"
