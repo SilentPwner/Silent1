@@ -1,14 +1,16 @@
-import ccxt
-import pandas as pd
-import numpy as np
+import requests
+import json
 import time
+import hmac
+import hashlib
+import pandas as pd
+import asyncio
+import websockets
 import logging
 from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 import os
-import asyncio
-import websockets
-import json
+import numpy as np
 import pandas_ta as ta
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, GridSearchCV
@@ -30,58 +32,123 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# === تعريف الاتصال الصحيح بمنصة CoinEx ===
-try:
-    exchange = ccxt.coinex({
-        'apiKey': API_KEY,
-        'secret': API_SECRET,
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',
-            'fetchCurrencies': False,
-            'adjustForTimeDifference': True,
-        },
-        'urls': {
-            'api': {
-                'public': 'https://api.coinex.com/v2/spot', 
-                'private': 'https://api.coinex.com/v2/spot', 
-            },
-            'websocket': 'wss://socket.coinex.com/v2/spot'
-        },
-        'api': {
-            'public': {
-                'get': [
-                    'common/asset/config',
-                    'market/ticker/all',
-                    'market/order-book',
-                    'trades',
-                    'kline-data',
-                ],
-                'post': [],
-            },
-            'private': {
-                'get': [
-                    'balance',
-                    'order',
-                    'order/history',
-                    'order/deals',
-                ],
-                'post': [
-                    'order/place',
-                    'order/cancel',
-                ],
-            },
+# === URLs ===
+REST_URL = "https://api.coinex.com/v2" 
+SPOT_WS_URL = "wss://socket.coinex.com/v2/spot"
+
+# === توقيع الطلب الخاص ===
+def sign_request(params, secret):
+    sorted_params = '&'.join([f"{k}={params[k]}" for k in sorted(params)])
+    signature = hmac.new(secret.encode('utf-8'), sorted_params.encode('utf-8'), hashlib.sha256).hexdigest()
+    return signature
+
+# === إرسال طلب خاص ===
+def private_api_call(endpoint, method="GET", params=None):
+    url = f"{REST_URL}/{endpoint}"
+    timestamp = int(time.time() * 1000)
+    headers = {
+        'Content-Type': 'application/json',
+        'X-COINEX-APIKEY': API_KEY,
+    }
+    if params is None:
+        params = {}
+    params['timestamp'] = timestamp
+    params['sign'] = sign_request(params, API_SECRET)
+
+    if method == "GET":
+        response = requests.get(url, params=params, headers=headers)
+    elif method == "POST":
+        response = requests.post(url, data=json.dumps(params), headers=headers)
+    else:
+        raise ValueError("Unsupported HTTP method")
+
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"❌ خطأ في الاتصال بالسيرفر: {e}")
+        raise
+
+    return response.json()
+
+# === جلب الرصيد ===
+def fetch_balance():
+    result = private_api_call("spot/balance", method="GET")
+    balances = result.get('data', {})
+    usdt_free = float(balances.get('USDT', {}).get('available', 0))
+    return {'USDT': {'free': usdt_free}}
+
+# === جلب البيانات التاريخية OHLCV ===
+def fetch_ohlcv(symbol, timeframe='5m', limit=100):
+    url = f"{REST_URL}/spot/kline-data"
+    params = {
+        'market': symbol.replace('/', ''),
+        'type': timeframe,
+        'limit': limit
+    }
+    response = requests.get(url, params=params)
+    try:
+        data = response.json()['data']
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        logging.info(f"[{symbol}] تم جلب البيانات عبر REST API.")
+        return df
+    except Exception as e:
+        logging.error(f"[{symbol}] خطأ أثناء جلب البيانات: {e}")
+        raise
+
+# === تنفيذ أمر شراء/بيع ===
+def create_market_order(symbol, side, amount):
+    endpoint = "spot/order/place"
+    params = {
+        "market": symbol.replace('/', ''),
+        "side": side,
+        "amount": amount,
+        "order_type": "market"
+    }
+    result = private_api_call(endpoint, method="POST", params=params)
+    logging.info(f"✅ [{symbol}] تم تنفيذ الأمر: {result}")
+    return result
+
+def create_market_buy_order(symbol, amount):
+    return create_market_order(symbol, 'buy', amount)
+
+def create_market_sell_order(symbol, amount):
+    return create_market_order(symbol, 'sell', amount)
+
+# === تحديث البيانات عبر WebSocket ===
+async def ws_update_data(symbol):
+    uri = SPOT_WS_URL
+    symbol_clean = symbol.replace('/', '')
+    async with websockets.connect(uri) as websocket:
+        subscribe_msg = {
+            "method": "state",
+            "params": [symbol_clean, '5m', 100],
+            "id": int(time.time())
         }
-    })
-    logging.info("✅ تم تسجيل الدخول بنجاح إلى CoinEx.")
-except Exception as e:
-    logging.error(f"❌ فشل تسجيل الدخول إلى CoinEx: {e}")
-    raise
+        await websocket.send(json.dumps(subscribe_msg))
+        logging.info(f"[{symbol}] اشتراك في WebSocket")
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+                if 'data' in data:
+                    ohlcv = data['data']
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df = calculate_indicators(df)
+                    df = generate_ml_signals(df)
+                    yield df
+                await asyncio.sleep(1)
+            except websockets.ConnectionClosed:
+                logging.error(f"[{symbol}] ❌ انقطع الاتصال بـ WebSocket. إعادة الاتصال...")
+                await asyncio.sleep(10)
+                await websocket.close()
+                await websocket.connect()
 
 # === جلب الرصيد الحقيقي من المنصة ===
 def get_real_balance():
     try:
-        balance_info = exchange.fetch_balance()
+        balance_info = fetch_balance()
         usdt_balance = balance_info.get('USDT', {}).get('free', 0)
         if usdt_balance <= 0:
             logging.warning("⚠️ لا يوجد رصيد USDT حر. سيتم استخدام رصيد افتراضي قدره $100.")
@@ -124,6 +191,7 @@ def generate_ml_signals(df):
         X = df[features]
         y = df['ml_signal']
         model_path = 'trading_model.pkl'
+
         if os.path.exists(model_path):
             model = joblib.load(model_path)
             logging.info("🔄 تم تحميل نموذج ML سابق.")
@@ -141,10 +209,12 @@ def generate_ml_signals(df):
             y_pred = model.predict(X_test)
             accuracy = accuracy_score(y_test, y_pred)
             logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
+
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
             logging.info("🆕 تم حفظ نموذج ML جديد.")
+
         df['ml_signal'] = model.predict(X)
         logging.info("✅ تم توليد الإشارات الذكية باستخدام Random Forest.")
         return df
@@ -183,63 +253,21 @@ def execute_real_trade(symbol, side, amount):
             logging.warning(f"⚠️ الكمية غير كافية للصفقة: {amount:.8f}")
             return None
         if side == "buy":
-            order = exchange.create_market_buy_order(symbol, amount)
+            order = create_market_buy_order(symbol, amount)
             logging.info(f"✅ [BUY] أمر شراء تم تنفيذه: {order}")
         elif side == "sell":
-            order = exchange.create_market_sell_order(symbol, amount)
+            order = create_market_sell_order(symbol, amount)
             logging.info(f"✅ [SELL] أمر بيع تم تنفيذه: {order}")
         return order
     except Exception as e:
         logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
         return None
 
-# === تحديث البيانات عبر WebSocket ===
-async def ws_update_data(symbol):
-    uri = 'wss://socket.coinex.com/v2/spot'
-    symbol_clean = symbol.replace('/', '')
-    async with websockets.connect(uri) as websocket:
-        subscribe_msg = {
-            "method": "state",
-            "params": [symbol_clean, '5m', 100],
-            "id": int(time.time())
-        }
-        await websocket.send(json.dumps(subscribe_msg))
-        logging.info(f"[{symbol}] اشتراك في WebSocket")
-        while True:
-            try:
-                message = await websocket.recv()
-                data = json.loads(message)
-                if 'data' in data:
-                    ohlcv = data['data']
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df = calculate_indicators(df)
-                    df = generate_ml_signals(df)
-                    yield df
-                await asyncio.sleep(1)
-            except websockets.ConnectionClosed:
-                logging.error(f"[{symbol}] ❌ انقطع الاتصال بـ WebSocket. إعادة الاتصال...")
-                await asyncio.sleep(10)
-                await websocket.close()
-                await websocket.connect()
-
-# === جلب البيانات الحية عبر REST API ===
-def fetch_live_data(symbol, timeframe, limit=100):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        logging.info(f"[{symbol}] تم جلب البيانات عبر REST API.")
-        return df
-    except Exception as e:
-        logging.error(f"[{symbol}] خطأ أثناء جلب البيانات: {e}")
-        raise
-
 # === تحديث البيانات بشكل ذكي (جلب الجديد فقط) ===
 def fetch_new_data_only(df_old, symbol, timeframe):
     try:
         latest_timestamp = df_old['timestamp'].iloc[-1]
-        new_df = fetch_live_data(symbol, timeframe, limit=10)
+        new_df = fetch_ohlcv(symbol, timeframe, limit=10)
         new_data = new_df[new_df['timestamp'] > latest_timestamp]
         if not new_data.empty:
             updated_df = pd.concat([df_old, new_data], ignore_index=True)
@@ -329,7 +357,7 @@ async def run_trading_engine():
     per_asset_balance = investment_capital / len(symbols)
     dfs = {}
     for symbol in symbols:
-        df = fetch_live_data(symbol, '5m', limit=100)
+        df = fetch_ohlcv(symbol, '5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
@@ -356,9 +384,7 @@ async def main_loop():
     except KeyboardInterrupt:
         logging.info("🛑 البوت توقف يدويًا.")
 
-# =====================================================================================
-# ✅ START WEB SERVER HERE (Using Flask)
-# =====================================================================================
+# === START WEB SERVER HERE (Using Flask) ===
 app = Flask(__name__)
 @app.route('/')
 def home():
