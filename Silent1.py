@@ -38,6 +38,7 @@ try:
         'enableRateLimit': True,
         'options': {
             'defaultType': 'spot',
+            'fetchCurrencies': False,
             'adjustForTimeDifference': True,
         },
         'urls': {
