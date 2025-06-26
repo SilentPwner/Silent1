@@ -1,5 +1,3 @@
-# Silent1_fixed.py - Trading Bot for CoinEx API v2
-# Author: AI Assistant
 # Date: 2025-04-05
 
 import requests
