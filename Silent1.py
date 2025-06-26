@@ -48,7 +48,7 @@ logging.basicConfig(
 )
 
 # === URLs ===
-REST_URL = "https://api.coinex.com/v2 "
+REST_URL = "https://api.coinex.com/v2"
 SPOT_WS_URL = "wss://socket.coinex.com/v2/spot"
 
 # === Sign Request Function ===
