@@ -1,3 +1,7 @@
+# Silent1_fixed.py - Trading Bot for CoinEx API v2
+# Author: AI Assistant
+# Date: 2025-04-05
+
 import requests
 import json
 import time
@@ -19,12 +23,12 @@ import joblib
 from flask import Flask
 import threading
 
-# === تحميل المتغيرات البيئية ===
+# === Load Environment Variables ===
 load_dotenv()
 API_KEY = os.getenv('COINEX_API_KEY')
 API_SECRET = os.getenv('COINEX_API_SECRET')
 
-# === إعداد تسجيل الأخطاء والسجلات باستخدام RotatingFileHandler ===
+# === Logging Setup ===
 log_handler = RotatingFileHandler('bot_logs.log', maxBytes=1024 * 1024, backupCount=5)
 logging.basicConfig(
     handlers=[log_handler],
@@ -33,17 +37,16 @@ logging.basicConfig(
 )
 
 # === URLs ===
-REST_URL = "https://api.coinex.com/v2" 
+REST_URL = "https://api.coinex.com/v2 "
 SPOT_WS_URL = "wss://socket.coinex.com/v2/spot"
 
-# === توقيع الطلب الخاص ===
+# === Sign Request Function ===
 def sign_request(params, secret):
     sorted_params = '&'.join([f"{k}={params[k]}" for k in sorted(params)])
     signature = hmac.new(secret.encode('utf-8'), sorted_params.encode('utf-8'), hashlib.sha256).hexdigest()
     return signature
 
-
-# === إرسال طلب خاص ===
+# === Private API Call Function ===
 def private_api_call(endpoint, method="GET", params=None):
     url = f"{REST_URL}/{endpoint}"
     timestamp = int(time.time() * 1000)
@@ -51,84 +54,102 @@ def private_api_call(endpoint, method="GET", params=None):
         'Content-Type': 'application/json',
         'X-COINEX-APIKEY': API_KEY,
     }
+
     if params is None:
         params = {}
-    params['timestamp'] = timestamp
-    params['sign'] = sign_request(params, API_SECRET)
-    if method == "GET":
-        response = requests.get(url, params=params, headers=headers)
-    elif method == "POST":
-        response = requests.post(url, data=json.dumps(params), headers=headers)
-    else:
-        raise ValueError("Unsupported HTTP method")
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"❌ خطأ في الاتصال بالسيرفر: {e}")
-        raise
-    return response.json()
 
+    params.update({
+        'timestamp': timestamp,
+        'signature_type': 2,
+        'recv_window': 5000
+    })
 
-# === جلب معلومات السوق ===
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            params['sign'] = sign_request(params, API_SECRET)
+            if method == "GET":
+                response = requests.get(url, params=params, headers=headers, timeout=10)
+            elif method == "POST":
+                response = requests.post(url, data=json.dumps(params), headers=headers, timeout=10)
+            else:
+                raise ValueError("Unsupported HTTP method")
+
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                logging.error(f"❌ Invalid JSON response: {response.text[:200]}...")
+                raise
+
+            if data.get('code') != 0:
+                error_msg = data.get('message', 'Unknown error')
+                logging.error(f"❌ API Error: {error_msg}")
+                raise Exception(error_msg)
+
+            return data
+
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"⚠️ Network error ({attempt + 1}/3): {e}")
+            time.sleep(2)
+
+    logging.critical("❌ Failed after multiple attempts.")
+    raise Exception("Failed to complete private API request.")
+
+# === Fetch Market Info ===
 def get_market_info(markets=None):
-    """
-    جلب معلومات السوق من CoinEx API.
-
-    :param markets: قائمة بأسماء الأسواق (مثال: ['BTCUSDT', 'ETHUSDT']) أو None للجميع
-    :return: بيانات السوق
-    """
     url = f"{REST_URL}/spot/market"
     params = {}
-
     if markets:
         if len(markets) > 10:
-            raise ValueError("يُسمح بحد أقصى 10 أسواق فقط.")
+            raise ValueError("Max 10 markets allowed.")
         params["market"] = ",".join(markets)
 
-    try:
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                logging.error(f"❌ Invalid JSON response: {response.text[:200]}...")
+                time.sleep(2)
+                continue
 
-        if data.get("code") == 0:
-            market_data = {}
-            for item in data.get("data", []):
-                market_name = item["market"]
-                market_data[market_name] = {
-                    "taker_fee_rate": float(item.get("taker_fee_rate", "0")),
-                    "maker_fee_rate": float(item.get("maker_fee_rate", "0")),
-                    "min_amount": float(item.get("min_amount", "0")),
-                    "base_ccy": item.get("base_ccy", ""),
-                    "quote_ccy": item.get("quote_ccy", ""),
-                    "base_precision": item.get("base_ccy_precision", 8),
-                    "quote_precision": item.get("quote_ccy_precision", 2),
-                    "status": item.get("status", "active"),
-                    "is_amm_available": item.get("is_amm_available", False),
-                    "is_margin_available": item.get("is_margin_available", False),
-                    "is_pre_trading_available": item.get("is_pre_trading_available", False),
-                    "is_api_trading_available": item.get("is_api_trading_available", False),
-                }
-            logging.info(f"✅ تم استرجاع معلومات السوق بنجاح: {list(market_data.keys())}")
-            return market_data
-        else:
-            error_msg = data.get("message", "Unknown error")
-            logging.error(f"❌ فشل في جلب معلومات السوق: {error_msg}")
-            return None
+            if data.get("code") == 0:
+                market_data = {}
+                for item in data.get("data", []):
+                    market_name = item["market"]
+                    market_data[market_name] = {
+                        "taker_fee_rate": float(item.get("taker_fee_rate", "0")),
+                        "maker_fee_rate": float(item.get("maker_fee_rate", "0")),
+                        "min_amount": float(item.get("min_amount", "0")),
+                        "base_ccy": item.get("base_ccy", ""),
+                        "quote_ccy": item.get("quote_ccy", ""),
+                        "base_precision": item.get("base_ccy_precision", 8),
+                        "quote_precision": item.get("quote_ccy_precision", 2),
+                        "status": item.get("status", "offline"),
+                        "is_api_trading_available": item.get("is_api_trading_available", False),
+                    }
+                logging.info(f"✅ Market info fetched successfully: {list(market_data.keys())}")
+                return market_data
+            else:
+                error_msg = data.get("message", "Unknown error")
+                logging.error(f"❌ Failed to fetch market info: {error_msg}")
+                time.sleep(2)
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"⚠️ Network error ({attempt + 1}/3): {e}")
+            time.sleep(2)
+    return None
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"❌ خطأ أثناء الاتصال بواجهة CoinEx API: {e}")
-        return None
-
-
-# === جلب الرصيد ===
+# === Fetch Balance ===
 def fetch_balance():
     result = private_api_call("spot/balance", method="GET")
     balances = result.get('data', {})
     usdt_free = float(balances.get('USDT', {}).get('available', 0))
     return {'USDT': {'free': usdt_free}}
 
-
-# === جلب البيانات التاريخية OHLCV ===
+# === Fetch OHLCV Data ===
 def fetch_ohlcv(symbol, timeframe='5m', limit=100):
     url = f"{REST_URL}/spot/kline-data"
     params = {
@@ -136,19 +157,37 @@ def fetch_ohlcv(symbol, timeframe='5m', limit=100):
         'type': timeframe,
         'limit': limit
     }
-    response = requests.get(url, params=params)
-    try:
-        data = response.json()['data']
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        logging.info(f"[{symbol}] تم جلب البيانات عبر REST API.")
-        return df
-    except Exception as e:
-        logging.error(f"[{symbol}] خطأ أثناء جلب البيانات: {e}")
-        raise
 
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                logging.warning(f"[{symbol}] ⚠️ Invalid JSON response: {response.text[:200]}...")
+                time.sleep(2)
+                continue
 
-# === تنفيذ أمر شراء/بيع ===
+            if data.get('code') != 0:
+                error_msg = data.get('message', 'Unknown error')
+                logging.error(f"[{symbol}] ❌ Failed to fetch OHLCV: {error_msg}")
+                time.sleep(2)
+                continue
+
+            df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            logging.info(f"[{symbol}] ✅ OHLCV data fetched via REST.")
+            return df
+
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"[{symbol}] ⚠️ Request failed ({attempt + 1}/3): {e}")
+            time.sleep(2)
+
+    logging.critical(f"[{symbol}] ❌ Failed to fetch OHLCV after several attempts.")
+    return pd.DataFrame()
+
+# === Place Order ===
 def create_market_order(symbol, side, amount):
     endpoint = "spot/order/place"
     params = {
@@ -158,65 +197,65 @@ def create_market_order(symbol, side, amount):
         "order_type": "market"
     }
     result = private_api_call(endpoint, method="POST", params=params)
-    logging.info(f"✅ [{symbol}] تم تنفيذ الأمر: {result}")
+    logging.info(f"✅ [{symbol}] Order executed: {result}")
     return result
-
 
 def create_market_buy_order(symbol, amount):
     return create_market_order(symbol, 'buy', amount)
 
-
 def create_market_sell_order(symbol, amount):
     return create_market_order(symbol, 'sell', amount)
 
-
-# === تحديث البيانات عبر WebSocket ===
+# === WebSocket Update ===
 async def ws_update_data(symbol):
     uri = SPOT_WS_URL
     symbol_clean = symbol.replace('/', '')
-    async with websockets.connect(uri) as websocket:
-        subscribe_msg = {
-            "method": "state",
-            "params": [symbol_clean, '5m', 100],
-            "id": int(time.time())
-        }
-        await websocket.send(json.dumps(subscribe_msg))
-        logging.info(f"[{symbol}] اشتراك في WebSocket")
-        while True:
-            try:
-                message = await websocket.recv()
-                data = json.loads(message)
-                if 'data' in data:
-                    ohlcv = data['data']
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df = calculate_indicators(df)
-                    df = generate_ml_signals(df)
-                    yield df
-                await asyncio.sleep(1)
-            except websockets.ConnectionClosed:
-                logging.error(f"[{symbol}] ❌ انقطع الاتصال بـ WebSocket. إعادة الاتصال...")
-                await asyncio.sleep(10)
-                await websocket.close()
-                await websocket.connect()
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                subscribe_msg = {
+                    "method": "state",
+                    "params": [symbol_clean, '5m', 100],
+                    "id": int(time.time())
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                logging.info(f"[{symbol}] Subscribed to WebSocket")
 
+                while True:
+                    message = await websocket.recv()
+                    try:
+                        data = json.loads(message)
+                        if 'data' in data:
+                            ohlcv = data['data']
+                            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                            df = calculate_indicators(df)
+                            df = generate_ml_signals(df)
+                            yield df
+                    except json.JSONDecodeError:
+                        logging.warning(f"[{symbol}] ⚠️ Invalid WebSocket JSON: {message[:200]}...")
 
-# === جلب الرصيد الحقيقي من المنصة ===
+                    await asyncio.sleep(1)
+
+        except (websockets.ConnectionClosed, requests.exceptions.RequestException) as e:
+            logging.error(f"[{symbol}] ❌ Connection lost. Reconnecting...")
+            await asyncio.sleep(10)
+
+# === Get Real Balance from Exchange ===
 def get_real_balance():
     try:
         balance_info = fetch_balance()
         usdt_balance = balance_info.get('USDT', {}).get('free', 0)
         if usdt_balance <= 0:
-            logging.warning("⚠️ لا يوجد رصيد USDT حر. سيتم استخدام رصيد افتراضي قدره $100.")
+            logging.warning("⚠️ No free USDT balance. Using default $100.")
             return 100.0
-        logging.info(f"💰 الرصيد الحر في الحساب: {usdt_balance:.2f} USDT")
+        logging.info(f"💰 Free balance: {usdt_balance:.2f} USDT")
         return float(usdt_balance)
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء جلب الرصيد من المنصة: {e}")
-        return 100.0  # قيمة افتراضية إن فشلت العملية
+        logging.error(f"❌ Error fetching balance: {e}")
+        return 100.0
 
-
-# === حساب المؤشرات الفنية باستخدام Pandas TA ===
+# === Technical Indicators ===
 def calculate_indicators(df):
     try:
         df['SMA'] = ta.sma(df['close'], length=20)
@@ -232,26 +271,28 @@ def calculate_indicators(df):
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=14, d=3)
         df['stoch_k'] = stoch['STOCHk_14_3_3']
         df['stoch_d'] = stoch['STOCHd_14_3_3']
-        logging.info("✅ المؤشرات الفنية محسوبة")
+        logging.info("✅ Indicators calculated")
         return df
     except Exception as e:
-        logging.error(f"❌ خطأ في حساب المؤشرات: {e}")
+        logging.error(f"❌ Error calculating indicators: {e}")
         raise
 
-
-# === توليد إشارات باستخدام scikit-learn ===
+# === Generate ML Signals ===
 def generate_ml_signals(df):
     try:
         features = ['SMA', 'RSI', 'MACD', 'stoch_k', 'ATR', 'upper_band', 'lower_band']
         df = df.dropna(subset=features)
         df['future_close'] = df['close'].shift(-1)
         df['ml_signal'] = np.where(df['future_close'] > df['close'], 1, 0)
+
         X = df[features]
         y = df['ml_signal']
+
         model_path = 'trading_model.pkl'
+
         if os.path.exists(model_path):
             model = joblib.load(model_path)
-            logging.info("🔄 تم تحميل نموذج ML سابق.")
+            logging.info("🔄 Loaded existing model.")
         else:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             param_grid = {
@@ -265,20 +306,21 @@ def generate_ml_signals(df):
             model = grid_search.best_estimator_
             y_pred = model.predict(X_test)
             accuracy = accuracy_score(y_test, y_pred)
-            logging.info(f"🏆 دقة النموذج: {accuracy:.2f}")
+            logging.info(f"🏆 Model Accuracy: {accuracy:.2f}")
+
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
-            logging.info("🆕 تم حفظ نموذج ML جديد.")
+            logging.info("🆕 New model saved.")
+
         df['ml_signal'] = model.predict(X)
-        logging.info("✅ تم توليد الإشارات الذكية باستخدام Random Forest.")
+        logging.info("✅ ML signals generated.")
         return df
     except Exception as e:
-        logging.error(f"❌ خطأ أثناء توليد الإشارات الذكية: {e}")
+        logging.error(f"❌ Error generating ML signals: {e}")
         raise
 
-
-# === قراءة دقة النموذج السابق من ملف ===
+# === Model Accuracy Helper Functions ===
 def get_previous_model_accuracy():
     acc_file = 'model_accuracy.txt'
     if os.path.exists(acc_file):
@@ -289,41 +331,36 @@ def get_previous_model_accuracy():
                 return 0.0
     return 0.0
 
-
-# === حفظ دقة النموذج الحالي في ملف ===
 def save_model_accuracy(accuracy):
     with open('model_accuracy.txt', 'w') as f:
         f.write(f"{accuracy:.4f}")
 
-
-# === حساب VaR باستخدام نافذة زمنية ===
+# === VaR Calculation ===
 def calculate_var(returns, window=20, confidence_level=0.95):
     if len(returns) < window:
-        return 0.02  # قيمة افتراضية إن كانت البيانات غير كافية
-    recent_returns = returns[-window:]  # استخدام آخر N عناصر فقط
+        return 0.02
+    recent_returns = returns[-window:]
     var = -np.percentile(recent_returns, 100 * (1 - confidence_level))
     return abs(var)
 
-
-# === تنفيذ الصفقات الحقيقية عبر API ===
+# === Execute Real Trade via API ===
 def execute_real_trade(symbol, side, amount):
     try:
         if amount < 0.0001:
-            logging.warning(f"⚠️ الكمية غير كافية للصفقة: {amount:.8f}")
+            logging.warning(f"⚠️ Insufficient amount: {amount:.8f}")
             return None
         if side == "buy":
             order = create_market_buy_order(symbol, amount)
-            logging.info(f"✅ [BUY] أمر شراء تم تنفيذه: {order}")
+            logging.info(f"✅ [BUY] Order executed: {order}")
         elif side == "sell":
             order = create_market_sell_order(symbol, amount)
-            logging.info(f"✅ [SELL] أمر بيع تم تنفيذه: {order}")
+            logging.info(f"✅ [SELL] Order executed: {order}")
         return order
     except Exception as e:
-        logging.error(f"❌ خطأ في تنفيذ الأمر: {e}")
+        logging.error(f"❌ Error executing trade: {e}")
         return None
 
-
-# === تحديث البيانات بشكل ذكي (جلب الجديد فقط) ===
+# === Smart Data Update ===
 def fetch_new_data_only(df_old, symbol, timeframe):
     try:
         latest_timestamp = df_old['timestamp'].iloc[-1]
@@ -331,17 +368,16 @@ def fetch_new_data_only(df_old, symbol, timeframe):
         new_data = new_df[new_df['timestamp'] > latest_timestamp]
         if not new_data.empty:
             updated_df = pd.concat([df_old, new_data], ignore_index=True)
-            logging.info(f"[{symbol}] تم تحديث البيانات. عدد الشموع الجديدة: {len(new_data)}")
+            logging.info(f"[{symbol}] Data updated. New candles: {len(new_data)}")
             return updated_df
         else:
-            logging.info(f"[{symbol}] لا توجد بيانات جديدة بعد آخر تحقق.")
+            logging.info(f"[{symbol}] No new data available.")
             return df_old
     except Exception as e:
-        logging.error(f"[{symbol}] خطأ أثناء تحديث البيانات: {e}")
+        logging.error(f"[{symbol}] Error updating data: {e}")
         return df_old
 
-
-# === تنفيذ الصفقات لكل عملة ===
+# === Trading Logic per Asset ===
 def execute_trades(df, symbol, per_asset_balance):
     try:
         position = 0
@@ -349,14 +385,18 @@ def execute_trades(df, symbol, per_asset_balance):
         max_trades_per_day = 5
         last_trade_time = 0
         consecutive_losses = 0
+
         for i in range(1, len(df)):
             current_time = time.time()
             if current_time - last_trade_time < 1800 or trade_count >= max_trades_per_day:
                 continue
+
             current_price = df['close'].iloc[i]
+
             if 'ml_signal' not in df.columns:
-                logging.warning("⚠️ لا توجد إشارة ذكية حتى الآن. سيتم تخطي الصفقات.")
+                logging.warning("⚠️ No ML signal yet. Skipping trades.")
                 continue
+
             returns = df['close'].pct_change().dropna()
             wins = returns[returns > 0]
             losses = returns[returns < 0]
@@ -366,6 +406,7 @@ def execute_trades(df, symbol, per_asset_balance):
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
             kelly = max(0.01, min(kelly, 0.2))
             risk_amount = calculate_var(returns, window=20)
+
             if df['ml_signal'].iloc[i - 1] == 1 and position == 0:
                 amount_to_invest = per_asset_balance * kelly
                 amount = amount_to_invest / current_price
@@ -376,6 +417,7 @@ def execute_trades(df, symbol, per_asset_balance):
                 position = 1
                 last_trade_time = current_time
                 trade_count += 1
+
             elif df['ml_signal'].iloc[i - 1] == 0 and position == 1:
                 execute_real_trade(symbol, "sell", amount)
                 sell_price = current_price
@@ -388,6 +430,7 @@ def execute_trades(df, symbol, per_asset_balance):
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
+
             if position == 1:
                 trailing_stop = current_price * 0.98
                 if current_price <= stop_loss or current_price <= trailing_stop:
@@ -401,17 +444,18 @@ def execute_trades(df, symbol, per_asset_balance):
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
+
             if consecutive_losses >= 3:
-                logging.info("🛑 تم الوصول إلى الحد الأقصى للخسائر المتتالية.")
+                logging.info("🛑 Max consecutive losses reached.")
                 break
-        logging.info(f"📊 [{symbol}] رصيد هذه العملة: {per_asset_balance:.2f} دولار")
+
+        logging.info(f"📊 [{symbol}] Final balance: {per_asset_balance:.2f} USD")
         return per_asset_balance
     except Exception as e:
-        logging.error(f"❌ خطأ في تنفيذ الصفقات: {e}")
+        logging.error(f"❌ Error in trading logic: {e}")
         return per_asset_balance
 
-
-# === تنفيذ الصفقات على عدة عملات (Diversification) ===
+# === Run Trading Engine on Multiple Assets ===
 async def run_trading_engine():
     symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
     total_balance = get_real_balance()
@@ -419,23 +463,24 @@ async def run_trading_engine():
     per_asset_balance = investment_capital / len(symbols)
     dfs = {}
 
-    # --- التحقق من صلاحية التداول لكل سوق ---
     markets_list = [s.replace("/", "") for s in symbols]
     market_info = get_market_info(markets_list)
+
     if not market_info:
-        logging.error("❌ لم يتم العثور على معلومات السوق. سيتم إنهاء التشغيل.")
+        logging.error("❌ Market info not found. Exiting.")
         return
 
     for symbol in symbols:
         market_key = symbol.replace("/", "")
         if not market_info[market_key].get("is_api_trading_available", False):
-            logging.error(f"❌ التداول عبر API غير مفعل لسوق {market_key}.")
+            logging.error(f"❌ API trading disabled for {market_key}.")
             continue
+
         df = fetch_ohlcv(symbol, '5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
-        logging.info(f"[{symbol}] تم تجهيز البيانات والإشارات الذكية.")
+        logging.info(f"[{symbol}] Data and signals prepared.")
 
     while True:
         for symbol in symbols:
@@ -445,33 +490,30 @@ async def run_trading_engine():
                 df = calculate_indicators(df)
                 df = generate_ml_signals(df)
                 dfs[symbol] = df
-                logging.info(f"[{symbol}] تم تحديث البيانات والإشارات الذكية.")
+                logging.info(f"[{symbol}] Data & signals updated.")
             final_balance = execute_trades(df, symbol, per_asset_balance)
-            logging.info(f"[{symbol}] العائد: {final_balance:.2f} دولار")
+            logging.info(f"[{symbol}] Return: {final_balance:.2f} USD")
+
         overall_return = sum([final_balance for _, final_balance in dfs.items()])
-        logging.info(f"📈 العوائد الإجمالية بعد التنويع: {overall_return:.2f} دولار")
+        logging.info(f"📈 Total return after diversification: {overall_return:.2f} USD")
         await asyncio.sleep(60)
 
-
-# === الحلقة الرئيسية للبرنامج ===
+# === Main Loop ===
 async def main_loop():
     try:
         await run_trading_engine()
     except KeyboardInterrupt:
-        logging.info("🛑 البوت توقف يدويًا.")
+        logging.info("🛑 Bot stopped manually.")
 
-
-# === START WEB SERVER HERE (Using Flask) ===
+# === Web Server (Flask) ===
 app = Flask(__name__)
 @app.route('/')
 def home():
     return "Trading Bot is Running 🚀"
 
-
 def run_server():
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
 
 if __name__ == "__main__":
     server_thread = threading.Thread(target=run_server)
