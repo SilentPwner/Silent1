@@ -1,4 +1,7 @@
-# Date: 2025-04-06
+# Silent1_final.py - Trading Bot for CoinEx API v2 with Status Monitoring
+# Author: AI Assistant
+# Date: 2025-04-07
+
 import requests
 import json
 import time
@@ -69,6 +72,7 @@ def private_api_call(endpoint, method="GET", params=None):
         'signature_type': 2,
         'recv_window': 5000
     })
+    last_exception = None
     for attempt in range(3):  # Retry up to 3 times
         try:
             params['sign'] = sign_request(params, API_SECRET)
@@ -87,59 +91,17 @@ def private_api_call(endpoint, method="GET", params=None):
             if data.get('code') != 0:
                 error_msg = data.get('message', 'Unknown error')
                 logging.error(f"❌ API Error: {error_msg}")
+                system_status["api_authenticated"] = False
                 raise Exception(error_msg)
             system_status["api_authenticated"] = True
             return data
         except requests.exceptions.RequestException as e:
+            last_exception = e
             logging.warning(f"⚠️ Network error ({attempt + 1}/3): {e}")
             time.sleep(2)
     logging.critical("❌ Failed after multiple attempts.")
-    system_status["last_error"] = str(e)
+    system_status["last_error"] = str(last_exception) if last_exception else "Unknown network error"
     system_status["api_authenticated"] = False
-    return None
-
-# === Fetch Market Info ===
-def get_market_info(markets=None):
-    url = f"{REST_URL}/spot/market"
-    params = {}
-    if markets:
-        if len(markets) > 10:
-            raise ValueError("Max 10 markets allowed.")
-        params["market"] = ",".join(markets)
-    for attempt in range(3):
-        try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            try:
-                data = response.json()
-            except json.JSONDecodeError:
-                logging.error(f"❌ Invalid JSON response: {response.text[:200]}...")
-                time.sleep(2)
-                continue
-            if data.get("code") == 0:
-                market_data = {}
-                for item in data.get("data", []):
-                    market_name = item["market"]
-                    market_data[market_name] = {
-                        "taker_fee_rate": float(item.get("taker_fee_rate", "0")),
-                        "maker_fee_rate": float(item.get("maker_fee_rate", "0")),
-                        "min_amount": float(item.get("min_amount", "0")),
-                        "base_ccy": item.get("base_ccy", ""),
-                        "quote_ccy": item.get("quote_ccy", ""),
-                        "base_precision": item.get("base_ccy_precision", 8),
-                        "quote_precision": item.get("quote_ccy_precision", 2),
-                        "status": item.get("status", "offline"),
-                        "is_api_trading_available": item.get("is_api_trading_available", False),
-                    }
-                logging.info(f"✅ Market info fetched successfully: {list(market_data.keys())}")
-                return market_data
-            else:
-                error_msg = data.get("message", "Unknown error")
-                logging.error(f"❌ Failed to fetch market info: {error_msg}")
-                time.sleep(2)
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"⚠️ Network error ({attempt + 1}/3): {e}")
-            time.sleep(2)
     return None
 
 # === Fetch Balance ===
