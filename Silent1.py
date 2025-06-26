@@ -1,5 +1,4 @@
-# Date: 2025-04-05
-
+# Date: 2025-04-06
 import requests
 import json
 import time
@@ -20,6 +19,17 @@ from sklearn.metrics import accuracy_score
 import joblib
 from flask import Flask
 import threading
+
+# --- Global Status Variables ---
+system_status = {
+    "api_authenticated": False,
+    "websocket_connected": False,
+    "model_loaded": False,
+    "trading_active": False,
+    "server_running": True,
+    "last_error": None,
+    "timestamp": None
+}
 
 # === Load Environment Variables ===
 load_dotenv()
@@ -52,16 +62,13 @@ def private_api_call(endpoint, method="GET", params=None):
         'Content-Type': 'application/json',
         'X-COINEX-APIKEY': API_KEY,
     }
-
     if params is None:
         params = {}
-
     params.update({
         'timestamp': timestamp,
         'signature_type': 2,
         'recv_window': 5000
     })
-
     for attempt in range(3):  # Retry up to 3 times
         try:
             params['sign'] = sign_request(params, API_SECRET)
@@ -71,28 +78,25 @@ def private_api_call(endpoint, method="GET", params=None):
                 response = requests.post(url, data=json.dumps(params), headers=headers, timeout=10)
             else:
                 raise ValueError("Unsupported HTTP method")
-
             response.raise_for_status()
-
             try:
                 data = response.json()
             except json.JSONDecodeError:
                 logging.error(f"❌ Invalid JSON response: {response.text[:200]}...")
                 raise
-
             if data.get('code') != 0:
                 error_msg = data.get('message', 'Unknown error')
                 logging.error(f"❌ API Error: {error_msg}")
                 raise Exception(error_msg)
-
+            system_status["api_authenticated"] = True
             return data
-
         except requests.exceptions.RequestException as e:
             logging.warning(f"⚠️ Network error ({attempt + 1}/3): {e}")
             time.sleep(2)
-
     logging.critical("❌ Failed after multiple attempts.")
-    raise Exception("Failed to complete private API request.")
+    system_status["last_error"] = str(e)
+    system_status["api_authenticated"] = False
+    return None
 
 # === Fetch Market Info ===
 def get_market_info(markets=None):
@@ -102,7 +106,6 @@ def get_market_info(markets=None):
         if len(markets) > 10:
             raise ValueError("Max 10 markets allowed.")
         params["market"] = ",".join(markets)
-
     for attempt in range(3):
         try:
             response = requests.get(url, params=params, timeout=10)
@@ -113,7 +116,6 @@ def get_market_info(markets=None):
                 logging.error(f"❌ Invalid JSON response: {response.text[:200]}...")
                 time.sleep(2)
                 continue
-
             if data.get("code") == 0:
                 market_data = {}
                 for item in data.get("data", []):
@@ -155,7 +157,6 @@ def fetch_ohlcv(symbol, timeframe='5m', limit=100):
         'type': timeframe,
         'limit': limit
     }
-
     for attempt in range(3):
         try:
             response = requests.get(url, params=params, timeout=10)
@@ -166,22 +167,18 @@ def fetch_ohlcv(symbol, timeframe='5m', limit=100):
                 logging.warning(f"[{symbol}] ⚠️ Invalid JSON response: {response.text[:200]}...")
                 time.sleep(2)
                 continue
-
             if data.get('code') != 0:
                 error_msg = data.get('message', 'Unknown error')
                 logging.error(f"[{symbol}] ❌ Failed to fetch OHLCV: {error_msg}")
                 time.sleep(2)
                 continue
-
             df = pd.DataFrame(data['data'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             logging.info(f"[{symbol}] ✅ OHLCV data fetched via REST.")
             return df
-
         except requests.exceptions.RequestException as e:
             logging.warning(f"[{symbol}] ⚠️ Request failed ({attempt + 1}/3): {e}")
             time.sleep(2)
-
     logging.critical(f"[{symbol}] ❌ Failed to fetch OHLCV after several attempts.")
     return pd.DataFrame()
 
@@ -211,6 +208,7 @@ async def ws_update_data(symbol):
     while True:
         try:
             async with websockets.connect(uri) as websocket:
+                system_status["websocket_connected"] = True
                 subscribe_msg = {
                     "method": "state",
                     "params": [symbol_clean, '5m', 100],
@@ -218,7 +216,6 @@ async def ws_update_data(symbol):
                 }
                 await websocket.send(json.dumps(subscribe_msg))
                 logging.info(f"[{symbol}] Subscribed to WebSocket")
-
                 while True:
                     message = await websocket.recv()
                     try:
@@ -232,10 +229,9 @@ async def ws_update_data(symbol):
                             yield df
                     except json.JSONDecodeError:
                         logging.warning(f"[{symbol}] ⚠️ Invalid WebSocket JSON: {message[:200]}...")
-
                     await asyncio.sleep(1)
-
         except (websockets.ConnectionClosed, requests.exceptions.RequestException) as e:
+            system_status["websocket_connected"] = False
             logging.error(f"[{symbol}] ❌ Connection lost. Reconnecting...")
             await asyncio.sleep(10)
 
@@ -282,15 +278,13 @@ def generate_ml_signals(df):
         df = df.dropna(subset=features)
         df['future_close'] = df['close'].shift(-1)
         df['ml_signal'] = np.where(df['future_close'] > df['close'], 1, 0)
-
         X = df[features]
         y = df['ml_signal']
-
         model_path = 'trading_model.pkl'
-
         if os.path.exists(model_path):
             model = joblib.load(model_path)
             logging.info("🔄 Loaded existing model.")
+            system_status["model_loaded"] = True
         else:
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             param_grid = {
@@ -305,12 +299,11 @@ def generate_ml_signals(df):
             y_pred = model.predict(X_test)
             accuracy = accuracy_score(y_test, y_pred)
             logging.info(f"🏆 Model Accuracy: {accuracy:.2f}")
-
         if not os.path.exists(model_path) or accuracy > get_previous_model_accuracy():
             joblib.dump(model, model_path)
             save_model_accuracy(accuracy)
             logging.info("🆕 New model saved.")
-
+            system_status["model_loaded"] = True
         df['ml_signal'] = model.predict(X)
         logging.info("✅ ML signals generated.")
         return df
@@ -383,18 +376,14 @@ def execute_trades(df, symbol, per_asset_balance):
         max_trades_per_day = 5
         last_trade_time = 0
         consecutive_losses = 0
-
         for i in range(1, len(df)):
             current_time = time.time()
             if current_time - last_trade_time < 1800 or trade_count >= max_trades_per_day:
                 continue
-
             current_price = df['close'].iloc[i]
-
             if 'ml_signal' not in df.columns:
                 logging.warning("⚠️ No ML signal yet. Skipping trades.")
                 continue
-
             returns = df['close'].pct_change().dropna()
             wins = returns[returns > 0]
             losses = returns[returns < 0]
@@ -404,7 +393,6 @@ def execute_trades(df, symbol, per_asset_balance):
             kelly = win_prob - ((1 - win_prob) / (avg_win / avg_loss))
             kelly = max(0.01, min(kelly, 0.2))
             risk_amount = calculate_var(returns, window=20)
-
             if df['ml_signal'].iloc[i - 1] == 1 and position == 0:
                 amount_to_invest = per_asset_balance * kelly
                 amount = amount_to_invest / current_price
@@ -415,7 +403,6 @@ def execute_trades(df, symbol, per_asset_balance):
                 position = 1
                 last_trade_time = current_time
                 trade_count += 1
-
             elif df['ml_signal'].iloc[i - 1] == 0 and position == 1:
                 execute_real_trade(symbol, "sell", amount)
                 sell_price = current_price
@@ -428,7 +415,6 @@ def execute_trades(df, symbol, per_asset_balance):
                     consecutive_losses += 1
                 else:
                     consecutive_losses = 0
-
             if position == 1:
                 trailing_stop = current_price * 0.98
                 if current_price <= stop_loss or current_price <= trailing_stop:
@@ -442,11 +428,9 @@ def execute_trades(df, symbol, per_asset_balance):
                         consecutive_losses += 1
                     else:
                         consecutive_losses = 0
-
             if consecutive_losses >= 3:
                 logging.info("🛑 Max consecutive losses reached.")
                 break
-
         logging.info(f"📊 [{symbol}] Final balance: {per_asset_balance:.2f} USD")
         return per_asset_balance
     except Exception as e:
@@ -455,31 +439,27 @@ def execute_trades(df, symbol, per_asset_balance):
 
 # === Run Trading Engine on Multiple Assets ===
 async def run_trading_engine():
+    system_status["trading_active"] = True
     symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
     total_balance = get_real_balance()
     investment_capital = total_balance * 0.2
     per_asset_balance = investment_capital / len(symbols)
     dfs = {}
-
     markets_list = [s.replace("/", "") for s in symbols]
     market_info = get_market_info(markets_list)
-
     if not market_info:
         logging.error("❌ Market info not found. Exiting.")
         return
-
     for symbol in symbols:
         market_key = symbol.replace("/", "")
         if not market_info[market_key].get("is_api_trading_available", False):
             logging.error(f"❌ API trading disabled for {market_key}.")
             continue
-
         df = fetch_ohlcv(symbol, '5m', limit=100)
         df = calculate_indicators(df)
         df = generate_ml_signals(df)
         dfs[symbol] = df
         logging.info(f"[{symbol}] Data and signals prepared.")
-
     while True:
         for symbol in symbols:
             df = dfs[symbol]
@@ -491,7 +471,6 @@ async def run_trading_engine():
                 logging.info(f"[{symbol}] Data & signals updated.")
             final_balance = execute_trades(df, symbol, per_asset_balance)
             logging.info(f"[{symbol}] Return: {final_balance:.2f} USD")
-
         overall_return = sum([final_balance for _, final_balance in dfs.items()])
         logging.info(f"📈 Total return after diversification: {overall_return:.2f} USD")
         await asyncio.sleep(60)
@@ -499,22 +478,43 @@ async def run_trading_engine():
 # === Main Loop ===
 async def main_loop():
     try:
+        # Test API connection
+        balance_info = fetch_balance()
+        if balance_info:
+            system_status["api_authenticated"] = True
         await run_trading_engine()
     except KeyboardInterrupt:
+        system_status["trading_active"] = False
         logging.info("🛑 Bot stopped manually.")
 
 # === Web Server (Flask) ===
 app = Flask(__name__)
+
 @app.route('/')
 def home():
     return "Trading Bot is Running 🚀"
 
+@app.route('/status')
+def status():
+    system_status["timestamp"] = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+    return {
+        "status": "healthy" if all([
+            system_status["api_authenticated"],
+            system_status["websocket_connected"],
+            system_status["model_loaded"]
+        ]) else "unhealthy",
+        "details": system_status
+    }
+
 def run_server():
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))  # استخدام المنفذ 10000 كما في Render
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     server_thread = threading.Thread(target=run_server)
     server_thread.daemon = True
     server_thread.start()
+
+    time.sleep(2)  # Give the server a moment to start
+
     asyncio.run(main_loop())
