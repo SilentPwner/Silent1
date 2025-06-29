@@ -1,5 +1,5 @@
-# Silent1_final.py - Trading Bot with Advanced Connection Diagnostics
-# Author: AI Assistant
+# Silent1_final.py
+
 # Version: 2.3.0 (Corrected)
 
 import requests
