@@ -1,5 +1,5 @@
 # Silent1_final.py
-# Version: 3.0.0 (Stable - Based on Official SDK Practices)
+# Version: 3.1.0 (Strict SDK-Compliant Signing)
 
 import requests
 import json
@@ -25,16 +25,7 @@ import threading
 import datetime
 
 # --- Global Status & State Variables ---
-system_status = {
-    "api_authenticated": False,
-    "websocket_connected": False,
-    "model_loaded": False,
-    "trading_active": False,
-    "server_running": True,
-    "last_error": None,
-    "connection_errors": [],
-    "timestamp": None
-}
+system_status = { "api_authenticated": False, "websocket_connected": False, "model_loaded": False, "trading_active": False, "server_running": True, "last_error": None, "connection_errors": [], "timestamp": None }
 active_positions = {}
 
 # === Load Environment Variables ===
@@ -55,116 +46,112 @@ REST_URL = "https://api.coinex.com/v2"
 SPOT_WS_URL = "wss://socket.coinex.com/v2/spot"
 PING_URL = f"{REST_URL}/ping"
 
-# === Connection Diagnostics ===
-# <--- MODIFIED: Removed time sync test as it's unreliable and not used in official SDKs.
+# === V2 API Client (Strict SDK-Compliant Signing) ===
+# <--- CRITICAL FIX: Rewritten to strictly follow the official Python SDK logic.
+async def private_api_call(endpoint, method="GET", params=None):
+    """Make an authenticated API request for V2, strictly following official SDK."""
+    url = f"{REST_URL}/{endpoint}"
+    req_params = params.copy() if params else {}
+
+    try:
+        timestamp = str(int(time.time() * 1000))
+        
+        # This is the core logic from the official SDK
+        if method.upper() == 'GET' or method.upper() == 'DELETE':
+            # For GET/DELETE, sign the query parameters
+            # The official SDK does NOT add timestamp to the signing string for GET
+            to_sign = '&'.join(f'{k}={v}' for k, v in sorted(req_params.items()))
+        else:
+            # For POST/PUT, sign the JSON body
+            to_sign = json.dumps(req_params, separators=(',', ':'))
+
+        # Append the secret key to the string to be signed
+        string_to_sign_with_secret = f"{to_sign}{API_SECRET}"
+        
+        # Generate the signature
+        signature = hashlib.sha256(string_to_sign_with_secret.encode('utf-8')).hexdigest()
+        
+        headers = {
+            'Content-Type': 'application/json; charset=utf-8',
+            'X-COINEX-APIKEY': API_KEY,
+            'X-COINEX-TIMESTAMP': timestamp,
+            'X-COINEX-SIGNATURE': signature
+        }
+
+        # Make the request using an async-compatible method
+        if method.upper() == 'GET':
+            response_future = asyncio.to_thread(requests.get, url, params=req_params, headers=headers, timeout=15)
+        elif method.upper() == 'DELETE':
+            response_future = asyncio.to_thread(requests.delete, url, params=req_params, headers=headers, timeout=15)
+        elif method.upper() == 'POST':
+            response_future = asyncio.to_thread(requests.post, url, data=json.dumps(req_params), headers=headers, timeout=15)
+        else: # PUT
+            response_future = asyncio.to_thread(requests.put, url, data=json.dumps(req_params), headers=headers, timeout=15)
+            
+        response = await response_future
+
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('code') != 0:
+            raise ConnectionError(f"API Error Code {data.get('code')}: {data.get('message')}")
+        
+        return data.get('data')
+
+    except requests.exceptions.HTTPError as e:
+        # Provide more context for HTTP errors
+        logging.error(f"HTTP Error for {method} {url} with params {req_params}: {e.response.status_code} - {e.response.text}")
+        raise
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in private_api_call: {e}")
+        raise
+
+# === Connection Diagnostics (Stable) ===
 async def perform_connection_tests():
-    """Run essential connection tests."""
     system_status["connection_errors"] = []
-    tests = {
-        "API Connection": test_api_connection,
-        "API Authentication": test_api_authentication,
-        "WebSocket Connection": test_websocket_connection_async,
-    }
+    tests = {"API Connection": test_api_connection, "API Authentication": test_api_authentication, "WebSocket Connection": test_websocket_connection_async}
     results = {}
     for name, test_func in tests.items():
         try:
             success, message = await test_func() if asyncio.iscoroutinefunction(test_func) else test_func()
             results[name] = {"success": success, "message": message}
             if not success:
-                error_msg = f"{name}: {message}"
-                system_status["connection_errors"].append(error_msg)
-                # Stop if basic connection or auth fails
-                if name in ["API Connection", "API Authentication"]: break
+                system_status["connection_errors"].append(f"{name}: {message}")
+                if name != "WebSocket Connection": break
         except Exception as e:
             results[name] = {"success": False, "message": str(e)}
             system_status["connection_errors"].append(f"{name}: {str(e)}")
             break
-    
     system_status["api_authenticated"] = results.get("API Authentication", {}).get("success", False)
     system_status["websocket_connected"] = results.get("WebSocket Connection", {}).get("success", False)
     return results
 
 def test_api_connection():
-    """Test basic API connectivity using the public ping endpoint."""
     try:
         response = requests.get(PING_URL, timeout=10)
         response.raise_for_status()
         data = response.json()
-        if data.get('code') == 0 and data.get('message') == 'OK':
-            return True, "API is reachable and responding correctly."
-        return False, f"API reachable but responded with an error: {data}"
-    except Exception as e:
-        return False, str(e)
+        if data.get('code') == 0: return True, "API is reachable."
+        return False, f"API error: {data}"
+    except Exception as e: return False, str(e)
 
 async def test_api_authentication():
-    """Test API key authentication by fetching balance."""
     try:
-        # A successful call to any private endpoint confirms authentication.
         await private_api_call("asset/spot/balance", "GET")
         return True, "Authentication successful."
-    except Exception as e:
-        return False, f"Authentication failed: {e}"
+    except Exception as e: return False, f"Auth failed: {e}"
 
 async def test_websocket_connection_async():
-    """Async WebSocket connection test."""
     try:
-        async with websockets.connect(SPOT_WS_URL, ping_interval=20, ping_timeout=30, ssl=ssl.create_default_context()) as ws:
-            ping_req = {"method": "common.ping", "params": [], "id": int(time.time())}
-            await ws.send(json.dumps(ping_req))
-            response = await asyncio.wait_for(ws.recv(), timeout=10)
-            if '"pong"' in response:
-                return True, "WebSocket connected and responded to ping."
-            return False, f"Unexpected WebSocket response: {response}"
-    except Exception as e:
-        return False, str(e)
+        async with websockets.connect(SPOT_WS_URL, ping_interval=20, ping_timeout=30) as ws:
+            await ws.send(json.dumps({"method": "common.ping", "params": [], "id": int(time.time())}))
+            if '"pong"' in await asyncio.wait_for(ws.recv(), timeout=10): return True, "WebSocket connected."
+            return False, "Unexpected WebSocket response."
+    except Exception as e: return False, str(e)
 
-# === V2 API Client (Stable Signing Mechanism) ===
-async def private_api_call(endpoint, method="GET", params=None):
-    """Make an authenticated API request for V2."""
-    url = f"{REST_URL}/{endpoint}"
-    req_params = params.copy() if params else {}
-    
-    try:
-        timestamp = str(int(time.time() * 1000))
-        headers = {
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-COINEX-APIKEY': API_KEY,
-            'X-COINEX-TIMESTAMP': timestamp,
-        }
-        
-        if method == 'GET':
-            query_string = '&'.join(f'{k}={v}' for k, v in sorted(req_params.items()))
-            string_to_sign = f"{query_string}&timestamp={timestamp}{API_SECRET}" if query_string else f"timestamp={timestamp}{API_SECRET}"
-            req_params['timestamp'] = timestamp
-            response_future = asyncio.to_thread(requests.get, url, params=req_params, headers=headers, timeout=15)
-        else: # POST
-            body_str = json.dumps(req_params, separators=(',', ':'))
-            string_to_sign = f"{body_str}timestamp={timestamp}{API_SECRET}"
-            post_body = req_params
-            post_body['timestamp'] = timestamp
-            response_future = asyncio.to_thread(requests.post, url, data=json.dumps(post_body), headers=headers, timeout=15)
 
-        signature = hashlib.sha256(string_to_sign.encode('utf-8')).hexdigest()
-        headers['X-COINEX-SIGNATURE'] = signature
-        
-        response = await response_future
-
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-        
-        data = response.json()
-        if data.get('code') != 0:
-            raise ConnectionError(f"API Error Code {data.get('code')}: {data.get('message')}")
-        
-        return data.get('data')
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"API request failed: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"An unexpected error occurred in private_api_call: {e}")
-        raise
-
-# === Market Data & Order Functions (No changes needed) ===
+# --- The rest of the code is stable and does not need changes ---
+# === Market Data & Order Functions ===
 def get_market_info(markets=None):
     url = f"{REST_URL}/market/list"
     try:
@@ -209,7 +196,7 @@ async def execute_real_trade(symbol, side, amount):
         logging.error(f"Error executing {side} trade for {symbol}: {e}")
         return None
 
-# === TA, ML, and Logic Functions (No changes needed) ===
+# === TA, ML, and Logic Functions ===
 def calculate_indicators(df):
     try:
         df['SMA'] = ta.sma(df['close'], length=20)
@@ -251,10 +238,11 @@ async def trade_and_manage_position(df, symbol, usdt_per_trade, market_info):
         if last_signal == 0 or current_price <= pos['trailing_stop_price']:
             if await execute_real_trade(symbol, "sell", pos['quantity']): del active_positions[symbol]
             return
-        new_stop = current_price * 0.98 # 2% trailing stop
+        new_stop = current_price * 0.98
         if new_stop > pos['trailing_stop_price']: pos['trailing_stop_price'] = new_stop
     elif last_signal == 1 and usdt_per_trade >= min_trade:
-        if await execute_real_trade(symbol, "buy", usdt_per_trade):
+        order_result = await execute_real_trade(symbol, "buy", usdt_per_trade)
+        if order_result:
             active_positions[symbol] = {
                 'quantity': usdt_per_trade / current_price,
                 'trailing_stop_price': current_price * 0.98
@@ -262,7 +250,6 @@ async def trade_and_manage_position(df, symbol, usdt_per_trade, market_info):
 
 # === Main Trading Loop ===
 async def run_trading_engine():
-    global active_positions
     try:
         logging.info("--- Starting Trading Engine ---")
         await perform_connection_tests()
@@ -277,7 +264,7 @@ async def run_trading_engine():
         total_balance = balance_info.get('USDT', {}).get('free', 0)
         if total_balance < 20: raise ValueError("Insufficient balance to start trading.")
         
-        usdt_per_trade = (total_balance / len(symbols)) * 0.1 # Use 10% of portfolio per trade
+        usdt_per_trade = (total_balance / len(symbols)) * 0.1
         
         dfs = {s: generate_ml_signals(calculate_indicators(fetch_ohlcv(s, '5m', 200))) for s in symbols}
         system_status["trading_active"] = True
