@@ -1,7 +1,7 @@
 requests
 pandas
 pandas-ta
-numpy
+numpy==1.26.4
 scikit-learn
 joblib
 websockets
