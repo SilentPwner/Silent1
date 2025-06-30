@@ -1,2 +1,5 @@
-coinex-sdk-python
+# Main libraries
 python-dotenv
+
+# Install CoinEx SDK directly from GitHub
+git+https://github.com/coinex-official/coinex-api-sdk-python.git#egg=coinex
