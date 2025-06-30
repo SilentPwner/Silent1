@@ -1,2 +1,2 @@
-coinex-api-sdk-python
+coinex-sdk-python
 python-dotenv
