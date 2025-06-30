@@ -1,5 +1,10 @@
-# Main libraries
+requests
+pandas
+pandas-ta
+numpy
+scikit-learn
+joblib
+websockets
 python-dotenv
-
-# Install CoinEx SDK directly from GitHub
-git+https://github.com/coinex-official/coinex-api-sdk-python.git#egg=coinex
+Flask
+gunicorn
