@@ -1,5 +1,4 @@
-# Silent1_final.py - Trading Bot with Advanced Connection Diagnostics & Trailing Stop
-# Author: AI Assistant
+# Silent1_final.py
 # Version: 4.1.0 (Simplified Project Structure)
 
 import logging
