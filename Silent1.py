@@ -76,8 +76,7 @@ async def perform_connection_tests():
     
     return {"success": not system_status["connection_errors"], "errors": system_status["connection_errors"]}
 
-# === Order Functions ===
-async def fetch_balance():
+# === Order Functions ===async def fetch_balance():
     balance_data = await asyncio.to_thread(coinex_client.account.get_account_info)
     if balance_data.get('code') == 0 and 'data' in balance_data:
         usdt_balance = next((float(asset.get('available', 0)) for asset in balance_data['data']['spot'] if asset['ccy'] == 'USDT'), 0.0)
