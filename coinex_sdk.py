@@ -61,8 +61,8 @@ class Account:
         self.client = client
 
     def get_account_info(self):
-        # CORRECTED: The endpoint for v2 asset balance is /asset/balance
-        return self.client.request('GET', '/asset/balance', params={}, need_sign=True)
+        # CORRECTED (AGAIN): The final correct endpoint for v2 spot account balance
+        return self.client.request('GET', '/spot/balance', params={}, need_sign=True)
 
 class Market:
     def __init__(self, client):
