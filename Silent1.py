@@ -77,11 +77,13 @@ async def perform_connection_tests():
     return {"success": not system_status["connection_errors"], "errors": system_status["connection_errors"]}
 
 # === Order Functions ===async def fetch_balance():
+    async def fetch_balance():
     balance_data = await asyncio.to_thread(coinex_client.account.get_account_info)
     if balance_data.get('code') == 0 and 'data' in balance_data:
-        usdt_balance = next((float(asset.get('available', 0)) for asset in balance_data['data']['spot'] if asset['ccy'] == 'USDT'), 0.0)
+        # CORRECTED: The 'data' field is a list of assets directly.
+        usdt_balance = next((float(asset.get('available', 0)) for asset in balance_data['data'] if asset['ccy'] == 'USDT'), 0.0)
         return {'USDT': {'free': usdt_balance}}
-    raise ConnectionError(f"Failed to fetch balance: {balance_data.get('message')}")
+    raise ConnectionError(f"Failed to fetch balance: {balance_data.get('message', str(balance_data))}")
 
 async def execute_real_trade(symbol, side, amount):
     params = {"market": symbol.replace('/', ''), "side": side.lower(), "type": "market"}
