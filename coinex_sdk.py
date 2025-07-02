@@ -1,7 +1,7 @@
 # coinex_sdk.py
-# Description: A robust SDK for CoinEx v2 API with improved WebSocket handling.
+# Description: A robust SDK for CoinEx v2 API with corrected endpoints.
 # Author: AI Assistant
-# Version: 1.2.0 (Enhanced Reconnection Logic)
+# Version: 1.2.1 (Fixed account balance endpoint)
 
 import hashlib
 import json
@@ -61,8 +61,8 @@ class Account:
         self.client = client
 
     def get_account_info(self):
-        # The endpoint for v2 spot balance is /asset/spot/balance
-        return self.client.request('GET', '/asset/spot/balance', params={}, need_sign=True)
+        # CORRECTED: The endpoint for v2 asset balance is /asset/balance
+        return self.client.request('GET', '/asset/balance', params={}, need_sign=True)
 
 class Market:
     def __init__(self, client):
@@ -81,7 +81,7 @@ class WebSocketClient:
         self.max_reconnect_attempts = 15
         self.listen_task = None
         self.on_message_callback = None
-        self.subscribed_channels = [] # To store what we subscribed to
+        self.subscribed_channels = []
 
     async def connect(self, on_message_callback):
         self.on_message_callback = on_message_callback
@@ -91,7 +91,6 @@ class WebSocketClient:
         sdk_logger.info("WebSocket connection manager started.")
 
     async def _connection_manager(self):
-        """Manages the connection and reconnection loop."""
         while True:
             try:
                 sdk_logger.info(f"Attempting to connect to WebSocket... (Attempt {self.reconnect_attempts + 1})")
@@ -101,11 +100,9 @@ class WebSocketClient:
                     self.reconnect_attempts = 0
                     sdk_logger.info("WebSocket connected successfully.")
                     
-                    # If we were previously subscribed to channels, re-subscribe
                     if self.subscribed_channels:
                         await self.subscribe_to_tickers(self.subscribed_channels, resubscribing=True)
 
-                    # Main listening loop
                     async for message in self.ws:
                         if self.on_message_callback:
                             await self.on_message_callback(message)
@@ -119,7 +116,7 @@ class WebSocketClient:
             self.ws = None
             if self.reconnect_attempts < self.max_reconnect_attempts:
                 self.reconnect_attempts += 1
-                wait_time = min(60, 5 * self.reconnect_attempts) # Exponential backoff up to 60s
+                wait_time = min(60, 5 * self.reconnect_attempts)
                 sdk_logger.info(f"Waiting {wait_time} seconds before next reconnect attempt.")
                 await asyncio.sleep(wait_time)
             else:
@@ -131,7 +128,6 @@ class WebSocketClient:
             sdk_logger.warning("Cannot subscribe, WebSocket is not connected.")
             return
 
-        # Store the channels so we can re-subscribe on reconnect
         if not resubscribing:
             self.subscribed_channels = symbols
 
@@ -151,6 +147,6 @@ class WebSocketClient:
             try:
                 await self.ws.close()
             except websockets.exceptions.ConnectionClosed:
-                pass # Already closed
+                pass
         self.connected = False
         sdk_logger.info("WebSocket connection closed by client.")
