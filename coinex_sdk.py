@@ -1,7 +1,7 @@
 # coinex_sdk.py
-# Description: A robust SDK for CoinEx v2 API with corrected endpoints.
+# Description: A robust SDK for CoinEx v2 API with diagnostic tools.
 # Author: AI Assistant
-# Version: 1.2.1 (Fixed account balance endpoint)
+# Version: 1.3.0 (Diagnostic Version)
 
 import hashlib
 import json
@@ -11,10 +11,10 @@ import asyncio
 import websockets
 import logging
 
-# Configure logging for the SDK
 sdk_logger = logging.getLogger(__name__)
 
 class CoinEx:
+    # ... (باقي كود الكلاس CoinEx يبقى كما هو بدون تغيير) ...
     def __init__(self, access_id, secret_key):
         self.access_id = access_id
         self.secret_key = secret_key
@@ -56,22 +56,31 @@ class CoinEx:
 
         return response.json()
 
+
 class Account:
     def __init__(self, client):
         self.client = client
 
     def get_account_info(self):
-        # CORRECTED (AGAIN): The final correct endpoint for v2 spot account balance
+        # We will keep this as is, as it's the most likely candidate.
         return self.client.request('GET', '/spot/balance', params={}, need_sign=True)
+    
+    def get_pending_orders(self, market="BTCUSDT"):
+        # ADDED: A new, reliable endpoint for testing authentication and signing.
+        params = {"market": market}
+        return self.client.request('GET', '/spot/pending-order', params=params, need_sign=True)
 
 class Market:
+    # ... (باقي كود الكلاس Market يبقى كما هو بدون تغيير) ...
     def __init__(self, client):
         self.client = client
 
     def ping(self):
         return self.client.request('GET', '/ping')
 
+
 class WebSocketClient:
+    # ... (باقي كود الكلاس WebSocketClient يبقى كما هو بدون تغيير) ...
     def __init__(self, client):
         self.client = client
         self.ws_url = "wss://socket.coinex.com/v2/websocket"
