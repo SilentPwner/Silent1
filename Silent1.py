@@ -1,5 +1,5 @@
-# Silent1_Final_WebSocket_Version.py - 
-# Version: 5.0.0 (Refactored with separate SDK)
+# Silent1_Final_WebSocket_Version.py
+# Version: 5.1.0 (Corrected and Cleaned)
 
 import logging
 import os
@@ -12,7 +12,6 @@ import random
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-# websockets is now used by the SDK, not directly here.
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from logging.handlers import RotatingFileHandler
@@ -20,7 +19,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# --- Import the new SDK ---
+# --- Import the separate SDK ---
 from coinex_sdk import CoinEx
 
 # --- Global Status & State Variables ---
@@ -46,8 +45,6 @@ if not API_KEY or not API_SECRET:
     raise ValueError("CRITICAL: API_KEY or API_SECRET not found in .env file.")
 
 # === CoinEx SDK Integration ===
-# The SDK classes are now in coinex_sdk.py
-# We just need to initialize the main client here
 coinex_client = CoinEx(API_KEY, API_SECRET)
 
 # === Enhanced Logging Setup ===
@@ -70,17 +67,18 @@ async def perform_connection_tests():
         logging.info("Testing API Authentication...")
         auth_res = await asyncio.to_thread(coinex_client.account.get_account_info)
         if auth_res.get('code') != 0:
-            system_status["connection_errors"].append(f"API Authentication Failed: {auth_res.get('message')}")
+            error_msg = auth_res.get('message', str(auth_res))
+            system_status["connection_errors"].append(f"API Authentication Failed: {error_msg}")
         else:
             system_status["api_authenticated"] = True
     
     return {"success": not system_status["connection_errors"], "errors": system_status["connection_errors"]}
 
-# === Order Functions ===async def fetch_balance():
-    async def fetch_balance():
+# === Order Functions ===
+async def fetch_balance():
     balance_data = await asyncio.to_thread(coinex_client.account.get_account_info)
     if balance_data.get('code') == 0 and 'data' in balance_data:
-        # CORRECTED: The 'data' field is a list of assets directly.
+        # The 'data' field is a list of assets directly.
         usdt_balance = next((float(asset.get('available', 0)) for asset in balance_data['data'] if asset['ccy'] == 'USDT'), 0.0)
         return {'USDT': {'free': usdt_balance}}
     raise ConnectionError(f"Failed to fetch balance: {balance_data.get('message', str(balance_data))}")
@@ -135,13 +133,16 @@ def generate_ml_signals(df):
         if os.path.exists(model_path):
             model = joblib.load(model_path)
         else:
-            # Simple logic to create a placeholder model if one doesn't exist
             logging.info("Model not found. Creating a placeholder model.")
             df_clean['target'] = (df_clean['close'].shift(-5) > df_clean['close']).astype(int)
             df_clean = df_clean.dropna()
             X, y = df_clean[features], df_clean['target']
             if len(X) < 50: return df # Not enough data to train
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            
+            # Use stratify for imbalanced datasets
+            y_stratify = y if len(y.unique()) > 1 else None
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y_stratify)
+            
             model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42).fit(X_train, y_train)
             joblib.dump(model, model_path)
             logging.info(f"New model created and saved with accuracy: {accuracy_score(y_test, model.predict(X_test))}")
@@ -158,7 +159,7 @@ def is_market_weak(df):
     if len(df) < 15: return True
     volatility = (df['high'] - df['low']).mean() / df['close'].mean()
     volume_change = df['volume'].pct_change().abs().mean()
-    return volatility < 0.003 and volume_change < 0.1
+    return volatility < 0.003 or volume_change < 0.1
 
 # === Real-Time WebSocket Handler (Refactored) ===
 async def websocket_data_handler(symbols_to_watch, dfs):
@@ -184,29 +185,34 @@ async def websocket_data_handler(symbols_to_watch, dfs):
                     }], index=[timestamp])
                     
                     async with data_lock:
-                        df_current = dfs[symbol_key]
-                        dfs[symbol_key] = pd.concat([df_current, new_row]).last('24h') # Keep last 24h of data
+                        # Append new tick data
+                        dfs[symbol_key] = pd.concat([dfs[symbol_key], new_row])
+                        
+                        # Keep the dataframe from getting too large
+                        if len(dfs[symbol_key]) > 5000:
+                           dfs[symbol_key] = dfs[symbol_key].iloc[-5000:]
+                        
+                        # Create a copy for analysis to avoid race conditions
+                        analysis_df = dfs[symbol_key].copy()
                         
                         # Resample to 1-minute candles for consistent analysis
-                        df_resampled = dfs[symbol_key]['close'].resample('1T').ohlc()
-                        df_resampled['volume'] = dfs[symbol_key]['volume'].resample('1T').sum()
+                        df_resampled = analysis_df['close'].resample('1T').ohlc()
+                        df_resampled['volume'] = analysis_df['volume'].resample('1T').sum()
+                        df_resampled.dropna(inplace=True) # Remove intervals with no trades
                         
                         df_with_indicators = calculate_indicators(df_resampled)
                         dfs[symbol_key] = generate_ml_signals(df_with_indicators)
         except Exception as e:
-            logging.error(f"Error processing WebSocket message: {e} | Message: {message}")
+            logging.error(f"Error processing WebSocket message: {e} | Message: {message}", exc_info=True)
 
-    if await coinex_client.websocket.connect(on_message_callback=on_message_callback):
+    await coinex_client.websocket.connect(on_message_callback=on_message_callback)
+    if coinex_client.websocket.connected:
         system_status["websocket_connected"] = True
         await coinex_client.websocket.subscribe_to_tickers(symbols_to_watch)
-        while system_status["server_running"]:
-            if not coinex_client.websocket.connected:
-                system_status["websocket_connected"] = False
-                logging.warning("Detected WebSocket disconnect. SDK will attempt to reconnect.")
-            await asyncio.sleep(30)
+        logging.info("WebSocket handler is running and subscribed.")
     else:
         system_status["websocket_connected"] = False
-        logging.critical("Could not establish WebSocket connection after multiple retries.")
+        logging.critical("Could not establish initial WebSocket connection.")
 
 
 # === Helper Function for Dynamic Symbols ===
@@ -229,26 +235,32 @@ async def run_trading_engine():
         balance_info = await fetch_balance()
         total_balance = balance_info.get('USDT', {}).get('free', 0)
         if total_balance < 20:
-            raise ValueError(f"Insufficient balance ({total_balance} USDT) to start.")
+            raise ValueError(f"Insufficient balance ({total_balance:.2f} USDT) to start.")
         
-        usdt_per_trade = max(10, (total_balance / len(symbols_for_today)) * 0.2) # Min $10, 20% of slice
-        logging.info(f"Allocating ~${usdt_per_trade:.2f} per trade.")
+        usdt_per_trade = max(10, (total_balance / len(symbols_for_today)) * 0.2)
+        logging.info(f"Total balance: ${total_balance:.2f}. Allocating ~${usdt_per_trade:.2f} per trade.")
 
-        # Initialize DataFrames
         dfs = {s: pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']).set_index('timestamp') for s in ALL_SYMBOLS}
 
-        # Start the single WebSocket handler for all symbols
         asyncio.create_task(websocket_data_handler(symbols_for_today, dfs))
         
-        await asyncio.sleep(10) # Wait for some data to arrive
+        await asyncio.sleep(15) # Wait for WS connection and some data to arrive
+        
+        if not system_status["websocket_connected"]:
+            logging.critical("Aborting trading engine: WebSocket failed to connect.")
+            return
+
         system_status["trading_active"] = True
         logging.info("--- Trading Engine is now LIVE using WebSocket ---")
 
         while system_status["server_running"]:
             async with data_lock:
+                # Create a copy of keys to iterate over to avoid issues if dict changes
+                current_positions = list(active_positions.keys())
                 for symbol in symbols_for_today:
-                    if not dfs[symbol].empty:
-                        await trade_and_manage_position(dfs[symbol].copy(), symbol, usdt_per_trade)
+                    df_copy = dfs[symbol].copy()
+                    if not df_copy.empty:
+                        await trade_and_manage_position(df_copy, symbol, usdt_per_trade)
             await asyncio.sleep(random.uniform(5, 15))
 
     except Exception as e:
@@ -257,7 +269,8 @@ async def run_trading_engine():
         system_status["trading_active"] = False
         logging.info("--- Closing all open positions on shutdown ---")
         for symbol, position in list(active_positions.items()):
-            await execute_real_trade(symbol, "sell", position['quantity'])
+            if 'quantity' in position and position['quantity'] > 0:
+                await execute_real_trade(symbol, "sell", position['quantity'])
         logging.info("--- Trading Engine Shutdown Complete ---")
 
 async def trade_and_manage_position(df, symbol, usdt_per_trade):
@@ -274,28 +287,24 @@ async def trade_and_manage_position(df, symbol, usdt_per_trade):
     else:
         system_status["market_activity"][symbol] = "Active"
 
-    # Position Management
     if symbol in active_positions:
         pos = active_positions[symbol]
         pnl = (current_price - pos['entry_price']) / pos['entry_price']
         
-        # Take profit or stop loss
-        if last_signal == 0 or pnl <= -0.02: # Sell signal or 2% stop loss
-            logging.info(f"SELL signal for {symbol}. PNL: {pnl:.2%}. Closing position.")
+        if last_signal == 0 or current_price <= pos['trailing_stop_price']:
+            logging.info(f"SELL signal for {symbol} or stop triggered. PNL: {pnl:.2%}. Closing position.")
             if await execute_real_trade(symbol, "sell", pos['quantity']):
                 del active_positions[symbol]
-        # Trailing stop
         else:
             new_stop = current_price * 0.98 # 2% trailing stop
             if new_stop > pos['trailing_stop_price']:
                 pos['trailing_stop_price'] = new_stop
                 logging.debug(f"Updated trailing stop for {symbol} to {new_stop:.4f}")
 
-    # Entry Logic
-    elif last_signal == 1:
+    elif last_signal == 1 and symbol not in active_positions:
         logging.info(f"BUY signal for {symbol} at {current_price:.4f}. Executing trade.")
         order_result = await execute_real_trade(symbol, "buy", usdt_per_trade)
-        if order_result and 'filled_quantity' in order_result:
+        if order_result and 'filled_quantity' in order_result and float(order_result['filled_quantity']) > 0:
             filled_quantity = float(order_result['filled_quantity'])
             entry_price = float(order_result['avg_price'])
             active_positions[symbol] = {
@@ -310,17 +319,26 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "<h1>Trading Bot Status</h1><p><a href='/status'>View JSON Status</a></p>"
+
 @app.route('/status')
 def status():
     system_status["timestamp"] = datetime.datetime.utcnow().isoformat() + "Z"
-    return jsonify({"status": system_status, "positions": active_positions})
+    
+    # Create a serializable copy of positions
+    serializable_positions = {}
+    for symbol, data in active_positions.items():
+        serializable_positions[symbol] = {k: str(v) if isinstance(v, (np.float64, float)) else v for k, v in data.items()}
+
+    return jsonify({"status": system_status, "positions": serializable_positions})
+
 def run_server():
     port = int(os.getenv("PORT", 5000))
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
     app.run(host="0.0.0.0", port=port, threaded=True)
 
 async def main():
-    threading.Thread(target=run_server, daemon=True).start()
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
     try:
         await run_trading_engine()
     except KeyboardInterrupt:
@@ -328,9 +346,10 @@ async def main():
     finally:
         system_status["server_running"] = False
         await coinex_client.websocket.close()
+        server_thread.join(timeout=2)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Program exiting.")
+        logging.info("Program exiting gracefully.")
